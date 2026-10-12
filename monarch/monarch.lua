@@ -588,7 +588,7 @@ local function enable(screen, previous_screen)
 	end)
 end
 
-local function show_out(screen, next_screen, wait_for_transition, cb)
+local function show_out(screen, next_screen, wait_for_transition, cb, animate)
 	log("show_out()", screen.id)
 	assert(wait_for_transition ~= nil)
 	-- make sure the screen is loaded. scenario:
@@ -615,7 +615,7 @@ local function show_out(screen, next_screen, wait_for_transition, cb)
 		local next_is_popup = next_screen and next_screen.popup
 		local current_is_popup = screen.popup
 		if (not next_is_popup and not current_is_popup) or (current_is_popup) then
-			transition(screen, M.TRANSITION_SHOW_OUT, { next_screen = next_screen.id }, wait_for_transition)
+			transition(screen, M.TRANSITION_SHOW_OUT, { next_screen = next_screen.id, instant = animate == false or nil }, wait_for_transition)
 			screen.visible = false
 			unload(screen)
 		elseif next_is_popup then
@@ -626,7 +626,7 @@ local function show_out(screen, next_screen, wait_for_transition, cb)
 	end)
 end
 
-local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_transition, cb)
+local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_transition, cb, animate)
 	log("show_in()", screen.id, wait_for_transition)
 	assert(wait_for_transition ~= nil)
 	run_coroutine(screen, cb, function()
@@ -653,7 +653,7 @@ local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_t
 		-- wait one frame so that the init() of any script have time to run before starting transitions
 		cowait(screen, 0)
 		reset_timestep(screen)
-		transition(screen, M.TRANSITION_SHOW_IN, { previous_screen = previous_screen and previous_screen.id }, wait_for_transition)
+		transition(screen, M.TRANSITION_SHOW_IN, { previous_screen = previous_screen and previous_screen.id, instant = animate == false or nil }, wait_for_transition)
 		screen.visible = true
 		acquire_input(screen)
 		focus_gained(screen, previous_screen)
@@ -662,7 +662,7 @@ local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_t
 	end)
 end
 
-local function back_in(screen, previous_screen, wait_for_transition, cb)
+local function back_in(screen, previous_screen, wait_for_transition, cb, animate)
 	log("back_in()", screen.id)
 	assert(wait_for_transition ~= nil)
 	run_coroutine(screen, cb, function()
@@ -680,7 +680,7 @@ local function back_in(screen, previous_screen, wait_for_transition, cb)
 		cowait(screen, 0)
 		reset_timestep(screen)
 		if previous_screen and not previous_screen.popup then
-			transition(screen, M.TRANSITION_BACK_IN, { previous_screen = previous_screen.id }, wait_for_transition)
+			transition(screen, M.TRANSITION_BACK_IN, { previous_screen = previous_screen.id, instant = animate == false or nil }, wait_for_transition)
 		end
 		screen.visible = true
 		acquire_input(screen)
@@ -690,7 +690,7 @@ local function back_in(screen, previous_screen, wait_for_transition, cb)
 	end)
 end
 
-local function back_out(screen, next_screen, wait_for_transition, cb)
+local function back_out(screen, next_screen, wait_for_transition, cb, animate)
 	log("back_out()", screen.id)
 	assert(wait_for_transition ~= nil)
 	run_coroutine(screen, cb, function()
@@ -699,7 +699,7 @@ local function back_out(screen, next_screen, wait_for_transition, cb)
 		change_context(screen)
 		release_input(screen, next_screen)
 		focus_lost(screen, next_screen)
-		transition(screen, M.TRANSITION_BACK_OUT, { next_screen = next_screen and next_screen.id }, wait_for_transition)
+		transition(screen, M.TRANSITION_BACK_OUT, { next_screen = next_screen and next_screen.id, instant = animate == false or nil }, wait_for_transition)
 		if next_screen and screen.popup then
 			reset_timestep(next_screen)
 		end
@@ -749,6 +749,9 @@ end
 --				   show in transition even when transitioning to a different scene ID.
 -- 		* parallel_popup_exit - Set to true to close popups concurrently when showing a non-popup.
 --				   Ignored when sequential is true. Completion still waits for all popup exits.
+-- 		* transition_in - Set to false to request an instant incoming transition (message.instant).
+-- 		* transition_out - Set to false to request instant exits for the current screen and its popups.
+--				   The GUI transition helper handles instant requests; custom handlers must honor them.
 -- 		* no_stack - Set to true to load the screen without adding it to the screen stack.
 -- 		* pop - The number of screens to pop from the stack before adding the new one.
 -- @param data (*) - Optional data to set on the screen. Can be retrieved by the data() function
@@ -770,6 +773,8 @@ function M.show(id, options, data, cb)
 		co = coroutine.create(function()
 
 			local callbacks = callback_tracker()
+			local transition_in = options and options.transition_in
+			local transition_out = options and options.transition_out
 
 			local top = stack[#stack]
 			-- a screen can ignore the stack by setting the no_stack to true
@@ -801,10 +806,10 @@ function M.show(id, options, data, cb)
 					end
 					stack[#stack] = nil
 					if parallel_popup_exit then
-						show_out(top, screen, WAIT_FOR_TRANSITION, callbacks.track())
+						show_out(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_out)
 					else
 						async(function(await, resume)
-							await(show_out, top, screen, WAIT_FOR_TRANSITION, resume)
+							await(show_out, top, screen, WAIT_FOR_TRANSITION, resume, transition_out)
 						end)
 					end
 					top = stack[#stack]
@@ -846,15 +851,15 @@ function M.show(id, options, data, cb)
 			if same_screen or (options and options.sequential) then
 				if top then
 					async(function(await, resume)
-						await(show_out, top, screen, WAIT_FOR_TRANSITION, resume)
+						await(show_out, top, screen, WAIT_FOR_TRANSITION, resume, transition_out)
 					end)
 				end
-				show_in(screen, top, options and options.reload, add_to_stack, WAIT_FOR_TRANSITION, callbacks.track())
+				show_in(screen, top, options and options.reload, add_to_stack, WAIT_FOR_TRANSITION, callbacks.track(), transition_in)
 			else
 				-- show screen
-				show_in(screen, top, options and options.reload, add_to_stack, WAIT_FOR_TRANSITION, callbacks.track())
+				show_in(screen, top, options and options.reload, add_to_stack, WAIT_FOR_TRANSITION, callbacks.track(), transition_in)
 				if add_to_stack and top and not top.popup then
-					show_out(top, screen, WAIT_FOR_TRANSITION, callbacks.track())
+					show_out(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_out)
 				end
 			end
 
@@ -962,6 +967,8 @@ end
 --		Valid values:
 -- 		* sequential - Set to true to wait for the current screen to hide itself out before starting the
 --				   back in transition even when transitioning to a different scene ID.
+-- 		* transition_in - Set to false to request an instant back-in transition (message.instant).
+-- 		* transition_out - Set to false to request an instant back-out transition (message.instant).
 
 -- @param data (*) - Optional data to set for the previous screen
 -- @param cb (function) - Optional callback to invoke when the previous screen is visible again
@@ -970,6 +977,8 @@ function M.back(options, data, cb)
 
 	queue_action(function(action_done)
 		local callbacks = callback_tracker()
+		local transition_in = options and options.transition_in
+		local transition_out = options and options.transition_out
 		local screen = table.remove(stack)
 		if screen then
 			log("back()", screen.id)
@@ -983,8 +992,8 @@ function M.back(options, data, cb)
 					if data then
 						top.data = data
 					end
-					back_in(top, screen, WAIT_FOR_TRANSITION, back_cb)
-				end)
+					back_in(top, screen, WAIT_FOR_TRANSITION, back_cb, transition_in)
+				end, transition_out)
 			else
 				if top then
 					if data then
@@ -998,14 +1007,14 @@ function M.back(options, data, cb)
 					if screen.popup and not top.popup then
 						local back_cb = callbacks.track()
 						back_out(screen, top, WAIT_FOR_TRANSITION, function()
-							back_in(top, screen, WAIT_FOR_TRANSITION, back_cb)
-						end)
+							back_in(top, screen, WAIT_FOR_TRANSITION, back_cb, transition_in)
+						end, transition_out)
 					else
-						back_in(top, screen, WAIT_FOR_TRANSITION, callbacks.track())
-						back_out(screen, top, WAIT_FOR_TRANSITION, callbacks.track())
+						back_in(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_in)
+						back_out(screen, top, WAIT_FOR_TRANSITION, callbacks.track(), transition_out)
 					end
 				else
-					back_out(screen, top, WAIT_FOR_TRANSITION, callbacks.track())
+					back_out(screen, top, WAIT_FOR_TRANSITION, callbacks.track(), transition_out)
 				end
 			end
 		end

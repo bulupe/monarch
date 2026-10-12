@@ -17,7 +17,17 @@ The options table can contain the following fields:
 * `no_stack` (boolean) - If the `no_stack` flag is set Monarch will load the screen without adding it to the screen stack.
 * `sequential` (boolean) - If the `sequential` flag is set Monarch will start loading the screen only after the previous screen finished transitioning out.
 * `parallel_popup_exit` (boolean) - Opt into concurrent popup exits when showing a non-popup screen. Defaults to false. Ignored for popup destinations and when `sequential` is true. The show callback and queued navigation wait for every departing popup as well as the screen transitions. This overlaps lifecycle operations; it does not promise same-frame loading or unloading.
+* `transition_in` (boolean) - Set to false to request an instant `show_in` transition. Omitted or true uses the configured animation.
+* `transition_out` (boolean) - Set to false to request instant `show_out` transitions for all departing popups and the current screen. Omitted or true uses their configured animations.
 * `pop` (number) - If `pop` is set to a number, Monarch will pop that number of screens from the stack before adding the new one.
+
+Instant requests preserve transition messages, completion tracking, focus handling and unloading. The standard GUI transitions snap to their final state. Custom transition handlers must honor `message.instant`; custom GUI transition functions receive duration and delay zero. See [Transitions](README_TRANSITIONS.md#per-navigation-overrides). These options do not skip engine lifecycle waits or change which transitions are normally sent.
+
+For example, leave gameplay and its overlays together while keeping the menu entrance:
+
+```lua
+monarch.show("menu", { clear = true, parallel_popup_exit = true, transition_out = false })
+```
 
 ## monarch.replace(screen_id, [options], [data], [callback])
 Replace the top of the stack with a new screen. Equivalent to calling `monarch.show()` with `pop = 1`. It takes the same parameters as `monarch.show()`.
@@ -52,6 +62,10 @@ Go back to a previous Monarch screen. This operation will be added to the queue 
 The options table can contain the following fields:
 
 * `sequential` (boolean) - If the `sequential` flag is set Monarch will start loading the screen only after the previous screen finished transitioning out.
+* `transition_in` (boolean) - Set to false to request an instant `back_in` transition.
+* `transition_out` (boolean) - Set to false to request an instant `back_out` transition.
+
+Omitted or true uses the configured animation. These are the same overrides as `show()`, applied to back transitions. Returning from a popup to its underlying non-popup screen still does not send `back_in`, since that screen remained visible. Popup teardown still finishes before that screen regains focus and resumes its timestep. `hide()` and `clear()` retain their existing signatures and defaults.
 
 
 ## monarch.preload(screen_id, [options], [callback])

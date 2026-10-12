@@ -64,7 +64,7 @@ local function fixture()
 		monarch.register_proxy(id, id .. "_proxy", settings)
 		monarch.on_transition(id, function(kind, message, sender)
 			local key = id .. ":" .. kind
-			if settings.hold_out and kind == monarch.TRANSITION_SHOW_OUT then
+			if settings.hold_out and kind == monarch.TRANSITION_SHOW_OUT and not message.instant then
 				pending[key] = function() msg.post(sender, monarch.TRANSITION_DONE, {}) end
 			else
 				msg.post(sender, monarch.TRANSITION_DONE, {})
@@ -92,6 +92,12 @@ local function fixture()
 			if event.url == id and event.id == kind then return true end
 		end
 		return false
+	end
+	function f.last(id, kind)
+		for i = #history, 1, -1 do
+			local event = history[i]
+			if event.url == id and event.id == kind then return event end
+		end
 	end
 	return f
 end
@@ -206,4 +212,80 @@ test("five popup exits overlap", function()
 	assert(not f.monarch.is_busy())
 end)
 
-print(count .. " show option tests passed")
+test("exit override reaches every popup and game without overriding menu entrance", function()
+	local f = stack_fixture()
+	f.show("menu", { parallel_popup_exit = true, transition_out = false })
+	for _, id in ipairs({ "popup1", "popup2", "game" }) do
+		assert(f.last(id, f.monarch.TRANSITION_SHOW_OUT).data.instant == true)
+		assert(not f.monarch.is_loaded(id))
+	end
+	assert(f.last("menu", f.monarch.TRANSITION_SHOW_IN).data.instant == nil)
+	assert(not f.monarch.is_busy())
+end)
+
+test("entrance override is independent and not sticky", function()
+	local f = fixture()
+	f.add("game")
+	f.add("menu")
+	f.show("game")
+	f.show("menu", { transition_in = false })
+	assert(f.last("menu", f.monarch.TRANSITION_SHOW_IN).data.instant == true)
+	assert(f.last("game", f.monarch.TRANSITION_SHOW_OUT).data.instant == nil)
+	f.show("game")
+	assert(f.last("game", f.monarch.TRANSITION_SHOW_IN).data.instant == nil)
+	assert(f.last("menu", f.monarch.TRANSITION_SHOW_OUT).data.instant == nil)
+end)
+
+test("instant serial replacement of the same popup remains safe", function()
+	local f = stack_fixture()
+	f.show("popup1", { transition_in = false, transition_out = false, parallel_popup_exit = true })
+	assert(f.last("popup1", f.monarch.TRANSITION_SHOW_IN).data.instant == true)
+	assert(f.last("popup1", f.monarch.TRANSITION_SHOW_OUT).data.instant == true)
+	assert(f.monarch.is_visible("popup1") and not f.monarch.is_busy())
+end)
+
+for _, sequential in ipairs({ false, true }) do
+	for _, side in ipairs({ "in", "out", "both" }) do
+		test("back overrides " .. side .. ", sequential=" .. tostring(sequential), function()
+			local f = fixture()
+			f.add("game")
+			f.add("menu")
+			f.show("game")
+			f.show("menu")
+			local options = { sequential = sequential }
+			if side ~= "out" then options.transition_in = false end
+			if side ~= "in" then options.transition_out = false end
+			f.monarch.back(options)
+			f.drain()
+			assert((f.last("game", f.monarch.TRANSITION_BACK_IN).data.instant == true) == (side ~= "out"))
+			assert((f.last("menu", f.monarch.TRANSITION_BACK_OUT).data.instant == true) == (side ~= "in"))
+			assert(f.monarch.is_visible("game") and not f.monarch.is_busy())
+		end)
+	end
+end
+
+test("instant popup back-out preserves resume behavior", function()
+	local f = fixture()
+	f.add("game", { timestep_below_popup = 0 })
+	f.add("popup", { popup = true })
+	f.show("game")
+	f.show("popup")
+	f.monarch.back({ transition_in = false, transition_out = false })
+	f.drain()
+	assert(f.last("popup", f.monarch.TRANSITION_BACK_OUT).data.instant == true)
+	assert(not f.seen("game", f.monarch.TRANSITION_BACK_IN))
+	assert(f.last("game_proxy", "set_time_step").data.factor == 1)
+	assert(f.monarch.is_visible("game") and not f.monarch.is_busy())
+end)
+
+test("instant exit also works with no underlying screen", function()
+	local f = fixture()
+	f.add("game")
+	f.show("game")
+	f.monarch.back({ transition_out = false })
+	f.drain()
+	assert(f.last("game", f.monarch.TRANSITION_BACK_OUT).data.instant == true)
+	assert(not f.monarch.is_loaded("game") and not f.monarch.is_busy())
+end)
+
+print(count .. " show/back option tests passed")

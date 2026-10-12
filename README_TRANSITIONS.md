@@ -10,6 +10,14 @@ Transitions are configured through the `monarch.on_transition(screen_id, fn)` fu
 
 When a transition is completed it is up to the developer to send a `transition_done` (constant `monarch.TRANSITION_DONE`) message back to the sender to indicate that the transition is completed and that Monarch can continue the navigation sequence.
 
+## Per-navigation overrides
+
+`show()` (including `replace()`) and `back()` accept independent `transition_in = false` and `transition_out = false` options. Omitted or true preserves the scene's configured animation. A false value requests the final visual state immediately, without the animation's duration or delay. Exit overrides on `show()` also apply to each departing popup. `parallel_popup_exit = true` additionally allows those popup exits to overlap when showing a non-popup; `sequential = true` takes precedence.
+
+Monarch still delivers the appropriate `TRANSITION_SHOW_IN`, `TRANSITION_SHOW_OUT`, `TRANSITION_BACK_IN` or `TRANSITION_BACK_OUT` message, with `message.instant = true`, and waits for its normal `TRANSITION_DONE` acknowledgement. Loading, script initialization, focus messages and unload cleanup keep their normal lifecycle. An instant animation is not a promise that navigation completes in one frame.
+
+The standard GUI transition helper handles the flag for all four directions. Built-in fade, slide and scale functions set the final property directly, cancel its previous animation and acknowledge completion. Custom functions registered with `.show_in()`, `.show_out()`, `.back_in()` or `.back_out()` receive duration and delay zero and must apply their final state and invoke the callback. A custom `monarch.on_transition()` handler must check `message.instant` itself and acknowledge after applying its final state. Ignoring this flag preserves its normal animation; Monarch does not forcibly interrupt arbitrary user code.
+
 ## Transition URL
 This property is deprecated and will be removed in a future version of Monarch.
 

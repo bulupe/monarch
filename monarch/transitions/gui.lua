@@ -30,13 +30,24 @@ M.window_resized(sys.get_config_int("display.width"), sys.get_config_int("displa
 
 
 function M.instant(node, to, easing, duration, delay, cb)
-	cb()
+	if cb then cb() end
+end
+
+-- Instant requests must also restore the final visual state of preloaded GUIs.
+local function animate(node, property, value, easing, duration, delay, cb)
+	if duration == 0 and (delay or 0) == 0 then
+		gui.cancel_animation(node, property)
+		gui.set(node, property, value)
+		if cb then cb() end
+	else
+		gui.animate(node, property, value, easing, duration, delay, cb)
+	end
 end
 
 local function slide_in(direction, node, to, easing, duration, delay, cb)
 	local from = to + direction
 	gui.set_position(node, from)
-	gui.animate(node, gui.PROP_POSITION, to, easing, duration, delay, cb)
+	animate(node, gui.PROP_POSITION, to, easing, duration, delay, cb)
 end
 
 function M.slide_in_left(node, to, easing, duration, delay, cb)
@@ -59,7 +70,7 @@ end
 local function slide_out(direction, node, from, easing, duration, delay, cb)
 	local to = from + direction
 	gui.set_position(node, from)
-	gui.animate(node, gui.PROP_POSITION, to, easing, duration, delay, cb)
+	animate(node, gui.PROP_POSITION, to, easing, duration, delay, cb)
 end
 
 function M.slide_out_left(node, from, easing, duration, delay, cb)
@@ -80,12 +91,12 @@ end
 
 function M.scale_in(node, to, easing, duration, delay, cb)
 	gui.set_scale(node, ZERO_SCALE)
-	gui.animate(node, gui.PROP_SCALE, to.scale, easing, duration, delay, cb)
+	animate(node, gui.PROP_SCALE, to.scale, easing, duration, delay, cb)
 end
 
 function M.scale_out(node, from, easing, duration, delay, cb)
 	gui.set_scale(node, from.scale)
-	gui.animate(node, gui.PROP_SCALE, ZERO_SCALE, easing, duration, delay, cb)
+	animate(node, gui.PROP_SCALE, ZERO_SCALE, easing, duration, delay, cb)
 end
 
 function M.fade_out(node, from, easing, duration, delay, cb)
@@ -93,7 +104,7 @@ function M.fade_out(node, from, easing, duration, delay, cb)
 	to.w = 1
 	gui.set_color(node, to)
 	to.w = 0
-	gui.animate(node, gui.PROP_COLOR, to, easing, duration, delay, cb)
+	animate(node, gui.PROP_COLOR, to, easing, duration, delay, cb)
 end
 
 function M.fade_in(node, from, easing, duration, delay, cb)
@@ -101,7 +112,7 @@ function M.fade_in(node, from, easing, duration, delay, cb)
 	to.w = 0
 	gui.set_color(node, to)
 	to.w = 1
-	gui.animate(node, gui.PROP_COLOR, to, easing, duration, delay, cb)
+	animate(node, gui.PROP_COLOR, to, easing, duration, delay, cb)
 end
 
 
@@ -172,7 +183,7 @@ local function create()
 		end
 	end
 
-	local function start_transition(transition_id, url)
+	local function start_transition(transition_id, url, instant)
 		url = url or msg.url()
 		local t = transitions[transition_id]
 		table.insert(t.urls, url)
@@ -180,10 +191,14 @@ local function create()
 			current_transition = t
 			current_transition.id = transition_id
 			if #t.transitions > 0 then
+				-- Register all nodes before invoking any callback: instant transitions
+				-- complete synchronously, and must acknowledge the screen only once.
+				t.in_progress_count = #t.transitions
 				for i=1,#t.transitions do
 					local transition = t.transitions[i]
-					t.in_progress_count = t.in_progress_count + 1
-					transition.fn(transition.node, transition.node_data, transition.easing, transition.duration, transition.delay or 0, function()
+					local duration = instant and 0 or transition.duration
+					local delay = instant and 0 or transition.delay or 0
+					transition.fn(transition.node, transition.node_data, transition.easing, duration, delay, function()
 						t.in_progress_count = t.in_progress_count - 1
 						check_and_finish_transition(transition_id)
 					end)
@@ -218,7 +233,7 @@ local function create()
 		or message_id == monarch.TRANSITION_SHOW_OUT
 		or message_id == monarch.TRANSITION_BACK_IN
 		or message_id == monarch.TRANSITION_BACK_OUT then
-			start_transition(message_id, sender)
+			start_transition(message_id, sender, message and message.instant)
 		end
 	end
 
