@@ -747,6 +747,8 @@ end
 --				   This would be the case if doing a show() from a popup on the screen just below the popup.
 -- 		* sequential - Set to true to wait for the previous screen to show itself out before starting the
 --				   show in transition even when transitioning to a different scene ID.
+-- 		* parallel_popup_exit - Set to true to close popups concurrently when showing a non-popup.
+--				   Ignored when sequential is true. Completion still waits for all popup exits.
 -- 		* no_stack - Set to true to load the screen without adding it to the screen stack.
 -- 		* pop - The number of screens to pop from the stack before adding the new one.
 -- @param data (*) - Optional data to set on the screen. Can be retrieved by the data() function
@@ -787,16 +789,24 @@ function M.show(id, options, data, cb)
 					pop_all_popups = true
 				end
 
-				-- close popups, one by one, either all of them or the number specified by options.pop
+				-- Keep popup replacement serial: the incoming screen may be one of the
+				-- popups being unloaded. Non-popup destinations can opt into parallel exits.
+				local parallel_popup_exit = is_not_popup and options and options.parallel_popup_exit
+					and not options.sequential
+				-- close either all popups or the number specified by options.pop
 				while top and top.popup do
 					if not pop_all_popups then
 						if pop <= 0 then break end
 						pop = pop - 1
 					end
 					stack[#stack] = nil
-					async(function(await, resume)
-						await(show_out, top, screen, WAIT_FOR_TRANSITION, resume)
-					end)
+					if parallel_popup_exit then
+						show_out(top, screen, WAIT_FOR_TRANSITION, callbacks.track())
+					else
+						async(function(await, resume)
+							await(show_out, top, screen, WAIT_FOR_TRANSITION, resume)
+						end)
+					end
 					top = stack[#stack]
 				end
 
