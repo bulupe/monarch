@@ -272,7 +272,6 @@ local function register(id, settings)
 		screen_keeps_input_focus_when_below_popup = settings and settings.screen_keeps_input_focus_when_below_popup or false,
 		others_keep_input_focus_when_below_screen = settings and settings.others_keep_input_focus_when_below_screen or false,
 		preload_listeners = {},
-		manual_ready = settings and settings.manual_ready or false,
 	}
 	return screens[id]
 end
@@ -294,7 +293,7 @@ end
 --		* others_keep_input_focus_when_below_screen - If screens below this
 --		  screen should keep input focus
 --		* auto_preload - true if the screen should be automatically preloaded
--- manual_ready waits for ready_to_show; the scene owns preparation visibility/input.
+-- Register on_prepare in the scene's init to wait for ready_to_show.
 function M.register_proxy(id, proxy, settings)
 	assert(proxy, "You must provide a collection proxy URL")
 	local screen = register(id, settings)
@@ -323,7 +322,7 @@ M.register = M.register_proxy
 --		* others_keep_input_focus_when_below_screen - If screens below this
 --		  screen should keep input focus
 --		* auto_preload - true if the screen should be automatically preloaded
--- manual_ready waits for ready_to_show; the scene owns preparation visibility/input.
+-- Register on_prepare in the scene's init to wait for ready_to_show.
 function M.register_factory(id, factory, settings)
 	assert(factory, "You must provide a collection factory URL")
 	local screen = register(id, settings)
@@ -418,6 +417,7 @@ local function unload(screen, force)
 			screen.loaded = false
 			screen.preloaded = false
 			screen.initialized = false
+			screen.prepare_fn, screen.prepare_url = nil, nil
 			screen.wait_for = nil
 		end
 	elseif screen.factory then
@@ -429,6 +429,7 @@ local function unload(screen, force)
 		end
 		screen.factory_ids = nil
 		screen.initialized = false
+		screen.prepare_fn, screen.prepare_url = nil, nil
 		if screen.auto_preload and not force then
 			screen.loaded = false
 			screen.preloaded = true
@@ -713,15 +714,17 @@ local function prepare(screen, source, operation, options, data, cb)
 					end
 					screen.initialized = true
 				end
-				-- Manual scenes own hidden visuals and gameplay gating. Enable
+				-- init registers on_prepare, just like on_transition. Discover the
+				-- handler before deciding whether readiness is automatic.
+				cowait(screen, 0)
+			end
+			if request.check() and screen.prepare_fn and not screen.visible then
+				-- Preparing scenes own hidden visuals and gameplay gating. Enable
 				-- them so their update/timer-driven preparation can make progress.
-				if screen.manual_ready and not screen.loaded then
+				if not screen.loaded then
 					if screen.proxy then msg.post(screen.proxy, MSG_ENABLE) end
 					screen.loaded, screen.preloaded = true, false
 				end
-				cowait(screen, 0)
-			end
-			if request.check() and screen.manual_ready and not screen.visible then
 				request.stage = "readiness"
 				if screen.prepare_url and not request.ready then
 					msg.post(screen.prepare_url, M.PREPARE, { navigation_id = request.id, screen = screen.id })
@@ -1581,7 +1584,7 @@ function M.on_navigation(id, fn)
 	screen.navigation_url = fn and msg.url() or nil
 end
 
---- Register preparation for manual-ready scenes, including retained/reused ones.
+--- Register during scene init to opt into explicit readiness, including retained scenes.
 -- The callback receives the activation token; capture it in asynchronous work.
 function M.on_prepare(id, fn)
 	local screen = assert(screens[tohash(id)], "Screen is not registered")
@@ -1598,7 +1601,7 @@ end
 function M.ready_to_show(id, token)
 	local screen = screens[tohash(id)]
 	local request = screen and screen.preparation
-	if not request or not screen.manual_ready or not request.signal(token) then return false end
+	if not request or not screen.prepare_fn or not request.signal(token) then return false end
 	if screen.wait_for == WAITFOR_READY then
 		msg.post(screen.script, MSG_READY, { navigation_id = token })
 	end

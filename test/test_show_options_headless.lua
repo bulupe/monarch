@@ -14,6 +14,15 @@ local function fixture()
 	local monarch
 	local f = { history = history, load_waits = {} }
 	local clock_offset = 0
+	local function initialize(id)
+		-- Model scene init registering its handler before optional setup work.
+		local previous_context = current
+		current = id
+		local settings = settings_by_id[id]
+		if settings.prepare then monarch.on_prepare(id, settings.prepare) end
+		if settings.init then settings.init() end
+		current = previous_context
+	end
 	package.loaded.socket = { gettime = function() return frame / 60 + clock_offset end }
 	function f.block(seconds) clock_offset = clock_offset + seconds end
 	local function schedule(delay, context, fn)
@@ -36,10 +45,10 @@ local function fixture()
 			schedule(1, url, function()
 				local screen = proxies[url]
 				if screen and (id == "enable" or id == "disable" or id == "unload") then
-					drawn[screen] = id == "enable" and not settings_by_id[screen].manual_ready
+					drawn[screen] = id == "enable" and not settings_by_id[screen].prepare
 				end
-				if screen and id == "init" and settings_by_id[screen].init then
-					settings_by_id[screen].init()
+				if screen and id == "init" then
+					initialize(screen)
 				end
 				if id == "acquire_input_focus" then focused[url] = true end
 				if id == "release_input_focus" then focused[url] = false end
@@ -66,8 +75,8 @@ local function fixture()
 			end)
 		end,
 		create = function(url)
-			drawn[current] = not settings_by_id[current].manual_ready
-			if settings_by_id[current].init then settings_by_id[current].init() end
+			drawn[current] = not settings_by_id[current].prepare
+			initialize(current)
 			return { root = current .. "_instance" }
 		end,
 		unload = function(url) factory_status[url] = 0 end,
@@ -141,9 +150,7 @@ local function fixture()
 	end
 	function f.held(id) return pending[id .. ":" .. monarch.TRANSITION_SHOW_OUT] ~= nil end
 	function f.prepare(id, fn)
-		current = id
-		monarch.on_prepare(id, fn)
-		current = "controller"
+		settings_by_id[id].prepare = fn
 	end
 	function f.navigation(id, fn)
 		current = id
@@ -570,7 +577,7 @@ for _, factory in ipairs({ false, true }) do
 				f.add("old")
 				local token, started
 				f.monarch.add_listener("observer")
-				local settings = { factory = factory, manual_ready = true }
+				local settings = { factory = factory }
 				if immediate then settings.init = function()
 					token = f.monarch.preparation_id("new")
 					assert(token and f.monarch.ready_to_show("new", token))
@@ -605,7 +612,7 @@ for _, stage in ipairs({ "loading", "readiness" }) do
 	test("timeout preserves old screen during " .. stage .. " and rejects late completion", function()
 		local f = fixture()
 		f.add("old")
-		f.add("new", { load_delay = stage == "loading" and 30 or 1, manual_ready = stage == "readiness" })
+		f.add("new", { load_delay = stage == "loading" and 30 or 1 })
 		f.show("old")
 		f.cover("old")
 		local token, failures, calls = nil, 0, 0
@@ -675,7 +682,7 @@ end)
 
 test("manual popup covers its source only after readiness and reports completion to it", function()
 	local f = fixture()
-	f.add("base"); f.add("popup", { popup = true, manual_ready = true })
+	f.add("base"); f.add("popup", { popup = true })
 	f.show("base")
 	local token, finished
 	f.navigation("base", function(event) if event == f.monarch.NAVIGATION_FINISHED then finished = true end end)
@@ -690,7 +697,7 @@ end)
 
 test("retained manual scene gets a fresh preparation token when backing into it", function()
 	local f = fixture()
-	f.add("level", { manual_ready = true, auto_preload = true }); f.add("menu")
+	f.add("level", { auto_preload = true }); f.add("menu")
 	local previous, count = nil, 0
 	f.prepare("level", function(id)
 		assert(id ~= previous and not f.monarch.ready_to_show("level", previous))
@@ -707,7 +714,7 @@ end)
 
 test("manual failure reports once and restores outgoing controls through notification", function()
 	local f = fixture()
-	f.add("old"); f.add("new", { manual_ready = true })
+	f.add("old"); f.add("new")
 	f.show("old")
 	f.monarch.add_listener("old") -- Also registered globally: no duplicate delivery.
 	local blocked, failures, completed = false, 0, 0
@@ -764,7 +771,7 @@ test("proxy error reports failure and leaves the outgoing scene usable", functio
 end)
 
 test("removing a scene waiting for readiness rejects its token and releases navigation", function()
-	local f = fixture(); f.add("old"); f.add("new", { manual_ready = true })
+	local f = fixture(); f.add("old"); f.add("new")
 	f.show("old")
 	local token, called
 	f.prepare("new", function(id) token = id end)
@@ -797,5 +804,24 @@ test("prepared back dispatches entrance with enable", function()
 	local entrance = f.last("old", f.monarch.TRANSITION_BACK_IN)
 	assert(enabled.frame == entrance.frame, "Returning GUI can render before its entrance")
 end)
+
+for _, settings in ipairs({ {}, { factory = true }, { factory = true, auto_preload = true } }) do
+	test("destroyed scene drops preparation handler: factory=" .. tostring(settings.factory) .. ", cached=" .. tostring(settings.auto_preload), function()
+		local f = fixture(); f.add("level", settings); f.add("menu")
+		local calls = 0
+		f.prepare("level", function(token)
+			calls = calls + 1
+			assert(f.monarch.ready_to_show("level", token))
+		end)
+		f.show("level"); f.show("menu")
+		-- A new instance that does not register a handler is automatically ready.
+		f.prepare("level", nil)
+		local completed
+		f.monarch.back({ timeout = 1 }, nil, function(ok) completed = ok end)
+		f.drain()
+		assert(completed and calls == 1 and f.monarch.is_top("level"))
+		assert(not f.monarch.is_busy())
+	end)
+end
 
 print(count .. " show/back option tests passed")

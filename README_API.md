@@ -3,10 +3,10 @@
 
 ## Preparation and readiness
 
-Navigation prepares the destination before changing the stack or starting outgoing transitions. Ordinary proxy scenes are initialized before rendering is enabled. Enable `manual_ready` on the screen_proxy/screen_factory component (or registration settings) for a scene that needs asynchronous setup. Such scenes are enabled during preparation so updates and timers run: **the scene owns hiding its visuals, withholding input, and not starting gameplay until its entrance**. Factory instances also need scene-owned initial visibility because creation has no separate rendering-enable phase. Monarch does not acquire incoming input focus during preparation.
+Navigation prepares the destination before changing the stack or starting outgoing transitions. Register `on_prepare` during the scene's `init`, just like `on_transition`, to opt into explicit readiness. No proxy/factory setting is needed. Without a handler, the scene is automatically ready after initialization. Ordinary proxy scenes initialize before rendering is enabled. Scenes with a preparation handler are then enabled so updates and timers run: **the scene owns hiding its visuals, withholding input, and not starting gameplay until its entrance**. Factory instances also need scene-owned initial visibility because creation has no separate rendering-enable phase. Monarch does not acquire incoming input focus during preparation.
 
 ```lua
--- In a manual-ready scene's init; keep visuals hidden here.
+-- In the scene's init; keep visuals hidden here.
 monarch.on_prepare("level", function(token)
     build_level_incrementally(function()
         monarch.ready_to_show("level", token)
@@ -15,7 +15,7 @@ end)
 -- Continue forwarding on_message to monarch.on_message as for transitions.
 ```
 
-`on_prepare(id, fn)` runs after initialization and also when returning to a retained hidden scene. A visible scene being reused is already ready. `preparation_id(id)` returns the current activation token (or nil), allowing immediate readiness from init. `ready_to_show(id, token)` accepts a current token once; duplicate, expired and stale signals return false. Capture the token when starting asynchronous work rather than retrieving a new token in an old callback. `fail_to_show(id, token, reason)` reports setup failure. All required setup must be completed before signaling; optional decorations can continue after show-in.
+The registered `on_prepare(id, fn)` handler runs after initialization and also when returning to a retained hidden scene. Register it during `init`, not later in an update/timer: Monarch makes its readiness decision after initialization. A visible scene being reused is already ready. A destroyed instance's handler is discarded; a retained instance keeps it. `preparation_id(id)` returns the current activation token (or nil), allowing immediate readiness from init after registering the handler. `ready_to_show(id, token)` accepts a current token once; duplicate, expired and stale signals return false. Capture the token when starting asynchronous work rather than retrieving a new token in an old callback. `fail_to_show(id, token, reason)` reports setup failure. All required setup must be completed before signaling; optional decorations can continue after show-in.
 
 Preparation must use independent asynchronous work (engine resource APIs, updates, timers, events). Do not wait for another queued Monarch show/preload action to complete before signaling ready: that queue is deliberately reserved by the current navigation. Preload dependent screens before starting navigation if needed. Nested registration is supported; it does not bypass the navigation queue.
 

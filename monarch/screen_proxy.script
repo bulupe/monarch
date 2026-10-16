@@ -8,7 +8,6 @@ go.property("timestep_below_popup", 1)
 go.property("screen_keeps_input_focus_when_below_popup", false)
 go.property("others_keep_input_focus_when_below_screen", false)
 go.property("preload", false)
-go.property("manual_ready", false)
 
 
 function init(self)
@@ -24,7 +23,6 @@ function init(self)
 		screen_keeps_input_focus_when_below_popup = self.screen_keeps_input_focus_when_below_popup,
 		others_keep_input_focus_when_below_screen = self.others_keep_input_focus_when_below_screen,
 		auto_preload = self.preload,
-		manual_ready = self.manual_ready,
 	}
 
 	monarch.register_proxy(self.screen_id, self.screen_proxy, settings)
