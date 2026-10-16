@@ -1,5 +1,7 @@
 local callback_tracker = require "monarch.utils.callback_tracker"
 local async = require "monarch.utils.async"
+local preparation = require "monarch.utils.preparation"
+local clock = require("socket").gettime
 
 local M = {}
 
@@ -9,9 +11,13 @@ local WAITFOR_PROXY_LOADED = hash("waitfor_proxy_loaded")
 local WAITFOR_PROXY_UNLOADED = hash("waitfor_proxy_unloaded")
 local WAITFOR_TRANSITION_DONE = hash("waitfor_transition_done")
 local WAITFOR_HANDOVER = hash("waitfor_handover")
+local WAITFOR_READY = hash("waitfor_ready")
+local MSG_READY = hash("monarch_ready")
+local MSG_INIT = hash("init")
 
 local MSG_CONTEXT = hash("monarch_context")
 local MSG_PROXY_LOADED = hash("proxy_loaded")
+local MSG_PROXY_ERROR = hash("proxy_error")
 local MSG_PROXY_UNLOADED = hash("proxy_unloaded")
 local MSG_LAYOUT_CHANGED = hash("layout_changed")
 local MSG_RELEASE_INPUT_FOCUS = hash("release_input_focus")
@@ -39,12 +45,13 @@ M.SCREEN_TRANSITION_IN_FINISHED = hash("monarch_screen_transition_in_finished")
 M.SCREEN_TRANSITION_OUT_STARTED = hash("monarch_screen_transition_out_started")
 M.SCREEN_TRANSITION_OUT_FINISHED = hash("monarch_screen_transition_out_finished")
 M.SCREEN_TRANSITION_FAILED = hash("monarch_screen_transition_failed")
+M.NAVIGATION_STARTED = hash("monarch_navigation_started")
+M.NAVIGATION_FAILED = hash("monarch_navigation_failed")
+M.NAVIGATION_FINISHED = hash("monarch_navigation_finished")
+M.PREPARE = hash("monarch_prepare")
 
 local WAIT_FOR_TRANSITION = true
 local DO_NOT_WAIT_FOR_TRANSITION = false
-
-local debug_load_delay = 0
-local debug_load_screens = nil
 
 -- all registered screens
 local screens = {}
@@ -71,22 +78,6 @@ local hash_lookup = {}
 local function tohash(s)
 	hash_lookup[s] = hash_lookup[s] or (type(s) == "string" and hash(s) or s)
 	return hash_lookup[s]
-end
-
---- Simulate slow resource loading without blocking the game loop.
--- Disabled by default. Pass 0 to disable; an omitted screen_ids list targets all
--- screens. Only future actual loads are delayed, not already preloaded screens.
-function M.set_debug_load_delay(seconds, screen_ids)
-	assert(type(seconds) == "number" and seconds >= 0 and seconds < math.huge,
-		"Load delay must be a finite non-negative number")
-	assert(screen_ids == nil or type(screen_ids) == "table", "Screen ids must be a list or nil")
-	local filter
-	if screen_ids then
-		filter = {}
-		for _, id in ipairs(screen_ids) do filter[tohash(id)] = true end
-	end
-	debug_load_delay = seconds
-	debug_load_screens = filter
 end
 
 local function pcallfn(fn, ...)
@@ -281,6 +272,7 @@ local function register(id, settings)
 		screen_keeps_input_focus_when_below_popup = settings and settings.screen_keeps_input_focus_when_below_popup or false,
 		others_keep_input_focus_when_below_screen = settings and settings.others_keep_input_focus_when_below_screen or false,
 		preload_listeners = {},
+		manual_ready = settings and settings.manual_ready or false,
 	}
 	return screens[id]
 end
@@ -302,6 +294,7 @@ end
 --		* others_keep_input_focus_when_below_screen - If screens below this
 --		  screen should keep input focus
 --		* auto_preload - true if the screen should be automatically preloaded
+-- manual_ready waits for ready_to_show; the scene owns preparation visibility/input.
 function M.register_proxy(id, proxy, settings)
 	assert(proxy, "You must provide a collection proxy URL")
 	local screen = register(id, settings)
@@ -330,6 +323,7 @@ M.register = M.register_proxy
 --		* others_keep_input_focus_when_below_screen - If screens below this
 --		  screen should keep input focus
 --		* auto_preload - true if the screen should be automatically preloaded
+-- manual_ready waits for ready_to_show; the scene owns preparation visibility/input.
 function M.register_factory(id, factory, settings)
 	assert(factory, "You must provide a collection factory URL")
 	local screen = register(id, settings)
@@ -357,6 +351,7 @@ function M.unregister(id)
 		end
 	end
 	screen.unregistered = true
+	if screen.preparation then screen.preparation.fail("unregistered") end
 	if screen.wait_for then
 		assert(coroutine.resume(screen.co))
 	end
@@ -422,6 +417,7 @@ local function unload(screen, force)
 			coroutine.yield()
 			screen.loaded = false
 			screen.preloaded = false
+			screen.initialized = false
 			screen.wait_for = nil
 		end
 	elseif screen.factory then
@@ -432,6 +428,7 @@ local function unload(screen, force)
 			end
 		end
 		screen.factory_ids = nil
+		screen.initialized = false
 		if screen.auto_preload and not force then
 			screen.loaded = false
 			screen.preloaded = true
@@ -459,23 +456,19 @@ local function preload(screen)
 	end
 
 	screen.preloading = true
-	local delay = debug_load_delay
-	if delay > 0 and (not debug_load_screens or debug_load_screens[screen.id]) then
-		print("Monarch simulated load delay:", delay, "seconds for", screen.id)
-		cowait(screen, delay)
-		if screen.unregistered then
-			screen.preloading = false
-			return false, "Screen was unregistered during simulated loading"
-		end
-	end
 	if screen.proxy then
 		log("preload() proxy")
+		screen.load_error = nil
 		screen.wait_for = WAITFOR_PROXY_LOADED
 		msg.post(screen.proxy, MSG_ASYNC_LOAD)
 		coroutine.yield()
 		screen.wait_for = nil
 		if screen.unregistered then
 			return false, "Screen was unregistered while loading"
+		end
+		if screen.load_error then
+			screen.preloading = false
+			return false, screen.load_error
 		end
 	elseif screen.factory then
 		log("preload() factory")
@@ -520,8 +513,9 @@ local function load(screen)
 	if screen.proxy then
 		msg.post(screen.proxy, MSG_ENABLE)
 	elseif screen.factory then
-		screen.factory_ids = collectionfactory.create(screen.factory)
+		if not screen.factory_ids then screen.factory_ids = collectionfactory.create(screen.factory) end
 	end
+	screen.initialized = true
 	screen.loaded = true
 	screen.preloaded = false
 	return true
@@ -630,12 +624,128 @@ end
 
 -- Resource loading must not consume the outgoing scene's visual lifetime.
 -- Do this before changing the stack, focus or starting any exit transitions.
-local function prepare(screen, cb)
-	local ok, err = true, nil
-	run_coroutine(screen, function() cb(ok, err) end, function()
-		change_context(screen)
-		if not screen.loaded then ok, err = preload(screen) end
+local function notify_navigation(request, message_id, reason)
+	local message = {
+		navigation_id = request.id, screen = request.destination.id,
+		previous_screen = request.source and request.source.id,
+		operation = request.operation, reason = reason, stage = request.stage,
+	}
+	notify_transition_listeners(message_id, message)
+	local source = request.source
+	if source and not source.unregistered and source.navigation_url
+		and (message_id ~= M.NAVIGATION_FINISHED or source.loaded) then
+		for _, url in pairs(transition_listeners) do
+			if url == source.navigation_url then return message end
+		end
+		msg.post(source.navigation_url, message_id, message)
+	end
+	return message
+end
+
+-- Failure can complete navigation before an engine load completes. Keep its
+-- screen reserved until that load finishes and is cleaned up; a new request
+-- must never steal the coroutine or consume its late completion message.
+local function prepare(screen, source, operation, options, data, cb)
+	local request
+	request = preparation.new(options and options.timeout, clock,
+		function(delay, fn) return timer.delay(delay, false, fn) end,
+		timer.cancel,
+		function(ok, reason, completed)
+			if not ok then
+				local message = notify_navigation(completed, M.NAVIGATION_FAILED, reason)
+				notify_transition_listeners(M.SCREEN_TRANSITION_FAILED, message)
+			end
+			cb(ok, reason, completed)
+			if not ok and screen.preparation == completed and screen.wait_for == WAITFOR_READY then
+				msg.post(screen.script, MSG_READY, { navigation_id = completed.id })
+			end
+		end)
+	request.source, request.destination, request.operation = source, screen, operation
+	notify_navigation(request, M.NAVIGATION_STARTED)
+	local function reject(reason)
+		timer.delay(0, false, function() request.fail(reason) end)
+	end
+	if screen.preparation then reject("cleanup_pending"); return end
+	if screen.unregistered then reject("unregistered"); return end
+	if options and options.reload and (screen.loaded or screen.visible) then
+		reject("reload_requires_unloaded_screen")
+		return
+	end
+	screen.preparation = request
+	if operation == "show" or data ~= nil then screen.data = data end
+	local was_loaded = screen.loaded
+	local worker = coroutine.create(function()
+		if screen.preloading then
+			local co = coroutine.running()
+			M.when_preloaded(screen.id, function() assert(coroutine.resume(co)) end)
+			coroutine.yield()
+		end
+		if request.done or screen.unregistered then
+			if screen.preparation == request then screen.preparation = nil end
+			return
+		end
+		run_coroutine(screen, function()
+			if not request.done then request.complete() end
+			local function release()
+				if screen.preparation == request then screen.preparation = nil end
+			end
+			if not request.ok and not was_loaded and not screen.unregistered
+				and (screen.loaded or screen.preloaded or screen.factory_ids) then
+				run_coroutine(screen, release, function()
+					change_context(screen)
+					unload(screen, true)
+				end)
+			else
+				release()
+			end
+		end, function()
+			change_context(screen)
+			local ok, err = true, nil
+			if request.check() and not screen.loaded then ok, err = preload(screen) end
+			if not ok then request.fail(err) end
+			if request.check() then
+				request.stage = "initializing"
+				if not screen.initialized then
+					if screen.proxy then
+						msg.post(screen.proxy, MSG_INIT)
+					else
+						screen.factory_ids = collectionfactory.create(screen.factory)
+					end
+					screen.initialized = true
+				end
+				-- Manual scenes own hidden visuals and gameplay gating. Enable
+				-- them so their update/timer-driven preparation can make progress.
+				if screen.manual_ready and not screen.loaded then
+					if screen.proxy then msg.post(screen.proxy, MSG_ENABLE) end
+					screen.loaded, screen.preloaded = true, false
+				end
+				cowait(screen, 0)
+			end
+			if request.check() and screen.manual_ready and not screen.visible then
+				request.stage = "readiness"
+				if screen.prepare_url and not request.ready then
+					msg.post(screen.prepare_url, M.PREPARE, { navigation_id = request.id, screen = screen.id })
+				end
+				if not request.ready then
+					screen.wait_for = WAITFOR_READY
+					coroutine.yield()
+					screen.wait_for = nil
+				end
+			end
+		end)
 	end)
+	assert(coroutine.resume(worker))
+end
+
+local function await_prepare(screen, source, operation, options, data)
+	local ok, reason, request
+	async(function(await, resume)
+		await(prepare, screen, source, operation, options, data, function(a, b, c)
+			ok, reason, request = a, b, c
+			resume()
+		end)
+	end)
+	return ok, reason, request
 end
 
 local function exit_before_enter(exit, screen, next_screen, callbacks, gate, animate)
@@ -704,7 +814,7 @@ local function show_out(screen, next_screen, wait_for_transition, cb, animate, g
 			transition(screen, M.TRANSITION_SHOW_OUT, { next_screen = next_screen.id, instant = animate == false or nil }, wait_for_transition)
 			await_handover(screen, gate, transitioned)
 			screen.visible = false
-			unload(screen)
+			if screen ~= next_screen then unload(screen) end
 		elseif next_is_popup then
 			change_timestep(screen)
 			pcallfn(transitioned)
@@ -798,7 +908,7 @@ local function back_out(screen, next_screen, wait_for_transition, cb, animate, g
 			reset_timestep(next_screen)
 		end
 		screen.visible = false
-		unload(screen)
+		if screen ~= next_screen then unload(screen) end
 		active_transition_count = active_transition_count - 1
 		notify_transition_listeners(M.SCREEN_TRANSITION_OUT_FINISHED, { screen = screen.id, next_screen = next_screen and next_screen.id })
 	end)
@@ -837,8 +947,8 @@ end
 -- @param id (string|hash) - Id of the screen to show
 -- @param options (table) - Table with options when showing the screen (can be nil). Valid values:
 -- 		* clear - Set to true if the stack should be cleared down to an existing instance of the screen
--- 		* reload - Set to true if screen should be reloaded if it already exists in the stack and is loaded.
---				   This would be the case if doing a show() from a popup on the screen just below the popup.
+-- 		* reload - Loaded-instance reload is rejected before teardown; use a separate loading screen.
+-- 		* timeout - Optional preparation deadline in seconds; nil/zero disables it.
 -- 		* sequential - Set to true to wait for the previous screen to show itself out before starting the
 --				   show in transition even when transitioning to a different scene ID.
 -- 		* parallel_popup_exit - Set to true to close popups concurrently when showing a non-popup.
@@ -849,8 +959,10 @@ end
 -- 		* no_stack - Set to true to load the screen without adding it to the screen stack.
 -- 		* pop - The number of screens to pop from the stack before adding the new one.
 -- @param data (*) - Optional data to set on the screen. Can be retrieved by the data() function
--- @param cb (function) - Optional callback to invoke when screen is shown
+-- @param cb (function) - Optional callback(success, result) after completion or preparation failure
 function M.show(id, options, data, cb)
+	assert(not options or options.timeout == nil or (type(options.timeout) == "number"
+		and options.timeout >= 0 and options.timeout < math.huge), "Invalid preparation timeout")
 	assert(id, "You must provide a screen id")
 	id = tohash(id)
 	assert(screens[id], ("There is no screen registered with id %s"):format(tostring(id)))
@@ -861,8 +973,6 @@ function M.show(id, options, data, cb)
 			action_error(("show() there is no longer a screen with id %s"):format(tostring(id)))
 			return
 		end
-		screen.data = data
-
 		local co
 		co = coroutine.create(function()
 
@@ -872,18 +982,12 @@ function M.show(id, options, data, cb)
 			-- Reserve navigation while preparing resources, including the interval
 			-- before individual transition coroutines have started.
 			active_transition_count = active_transition_count + 1
-			if M.is_preloading(id) then
-				async(function(await, resume) await(M.when_preloaded, id, resume) end)
-			end
-			if not screen.loaded and not screen.preloaded then
-				local prepared, prepare_error
-				async(function(await, resume) prepared, prepare_error = await(prepare, screen, resume) end)
-				if not prepared then
-					active_transition_count = active_transition_count - 1
-					notify_transition_listeners(M.SCREEN_TRANSITION_FAILED, { screen = id })
-					action_error(prepare_error)
-					return
-				end
+			local prepared, prepare_error, request = await_prepare(screen, stack[#stack], "show", options, data)
+			if not prepared then
+				active_transition_count = active_transition_count - 1
+				pcallfn(cb, false, { reason = prepare_error, navigation_id = request.id, stage = request.stage })
+				pcallfn(action_done)
+				return
 			end
 			-- The same registered instance cannot be both retained and reloaded.
 			local gate = not (screen.loaded and M.in_stack(id)) and handover_gate() or nil
@@ -964,7 +1068,8 @@ function M.show(id, options, data, cb)
 
 			callbacks.when_done(function()
 				active_transition_count = active_transition_count - 1
-				pcallfn(cb)
+				notify_navigation(request, M.NAVIGATION_FINISHED)
+				pcallfn(cb, true, { navigation_id = request.id })
 				pcallfn(action_done)
 			end)
 		end)
@@ -978,8 +1083,8 @@ end
 -- @param id (string|hash) - Id of the screen to show
 -- @param options (table) - Table with options when showing the screen (can be nil). Valid values:
 -- 		* clear - Set to true if the stack should be cleared down to an existing instance of the screen
--- 		* reload - Set to true if screen should be reloaded if it already exists in the stack and is loaded.
---				   This would be the case if doing a show() from a popup on the screen just below the popup.
+-- 		* reload - Loaded-instance reload is rejected before teardown.
+-- 		* timeout - Optional preparation deadline in seconds; nil/zero disables it.
 -- 		* no_stack - Set to true to load the screen without adding it to the screen stack.
 -- @param data (*) - Optional data to set on the screen. Can be retrieved by the data() function
 -- @param cb (function) - Optional callback to invoke when screen is shown
@@ -1073,6 +1178,8 @@ end
 -- @param data (*) - Optional data to set for the previous screen
 -- @param cb (function) - Optional callback to invoke when the previous screen is visible again
 function M.back(options, data, cb)
+	assert(not options or options.timeout == nil or (type(options.timeout) == "number"
+		and options.timeout >= 0 and options.timeout < math.huge), "Invalid preparation timeout")
 	log("back() queuing action")
 
 	queue_action(function(action_done, action_error)
@@ -1082,19 +1189,15 @@ function M.back(options, data, cb)
 			local transition_out = options and options.transition_out
 			active_transition_count = active_transition_count + 1
 			local destination = stack[#stack - 1]
+			local request
 			if destination and destination ~= stack[#stack] then
-				if destination.preloading then
-					async(function(await, resume) await(M.when_preloaded, destination.id, resume) end)
-				end
-				if not destination.loaded and not destination.preloaded then
-					local ok, err
-					async(function(await, resume) ok, err = await(prepare, destination, resume) end)
-					if not ok then
-						active_transition_count = active_transition_count - 1
-						notify_transition_listeners(M.SCREEN_TRANSITION_FAILED, { screen = destination.id })
-						action_error(err)
-						return
-					end
+				local ok, err
+				ok, err, request = await_prepare(destination, stack[#stack], "back", options, data)
+				if not ok then
+					active_transition_count = active_transition_count - 1
+					pcallfn(cb, false, { reason = err, navigation_id = request.id, stage = request.stage })
+					pcallfn(action_done)
+					return
 				end
 			end
 			local screen = table.remove(stack)
@@ -1140,7 +1243,8 @@ function M.back(options, data, cb)
 
 			callbacks.when_done(function()
 				active_transition_count = active_transition_count - 1
-				pcallfn(cb)
+				if request then notify_navigation(request, M.NAVIGATION_FINISHED) end
+				pcallfn(cb, true, request and { navigation_id = request.id })
 				pcallfn(action_done)
 			end)
 		end)
@@ -1212,6 +1316,11 @@ function M.preload(id, options, cb)
 			action_error(("preload() there is no longer a screen with id %s"):format(tostring(id)))
 			return
 		end
+		if screen.preparation then
+			pcallfn(cb, false, { reason = "cleanup_pending" })
+			pcallfn(action_done)
+			return
+		end
 
 		-- keep_loaded is an option for monarch.preload()
 		-- use it to get the same behavior as the auto preload checkbox
@@ -1270,6 +1379,11 @@ function M.unload(id, cb)
 			action_error(("unload() there is no longer a screen with id %s"):format(tostring(id)))
 			return
 		end
+		if screen.preparation then
+			pcallfn(cb, false, { reason = "cleanup_pending" })
+			pcallfn(action_done)
+			return
+		end
 
 		if not screen.preloaded and not screen.loaded then
 			log("unload() screen is not loaded", tostring(id))
@@ -1319,21 +1433,48 @@ end
 
 
 function M.on_message(message_id, message, sender)
-	if message_id == MSG_PROXY_LOADED then
+	if message_id == MSG_READY then
 		local screen = find_screen(sender)
-		assert(screen, "Unable to find screen for loaded proxy")
+		if screen and screen.preparation and screen.preparation.id == message.navigation_id
+			and screen.wait_for == WAITFOR_READY then
+			assert(coroutine.resume(screen.co))
+		end
+	elseif message_id == M.PREPARE then
+		local screen = screens[message.screen]
+		if screen and screen.prepare_fn and screen.preparation
+			and screen.preparation.id == message.navigation_id and not screen.preparation.done then
+			screen.prepare_fn(message.navigation_id)
+		end
+	elseif message_id == M.NAVIGATION_STARTED or message_id == M.NAVIGATION_FAILED
+		or message_id == M.NAVIGATION_FINISHED then
+		local source = screens[message.previous_screen]
+		if source and source.navigation_fn and source.navigation_url == msg.url() then
+			source.navigation_fn(message_id, message, sender)
+		end
+	elseif message_id == MSG_PROXY_ERROR then
+		local screen = find_screen(sender)
+		if not screen then return end
+		screen.load_error = "proxy_error:" .. tostring(message.code)
+		if screen.wait_for == WAITFOR_PROXY_LOADED then
+			assert(coroutine.resume(screen.co))
+		elseif screen.preparation then
+			screen.preparation.fail(screen.load_error)
+		end
+	elseif message_id == MSG_PROXY_LOADED then
+		local screen = find_screen(sender)
+		if not screen then return end -- A removed owner may still have a load reply in flight.
 		if screen.wait_for == WAITFOR_PROXY_LOADED then
 			assert(coroutine.resume(screen.co))
 		end
 	elseif message_id == MSG_PROXY_UNLOADED then
 		local screen = find_screen(sender)
-		assert(screen, "Unable to find screen for unloaded proxy")
+		if not screen then return end
 		if screen.wait_for == WAITFOR_PROXY_UNLOADED then
 			assert(coroutine.resume(screen.co))
 		end
 	elseif message_id == MSG_CONTEXT then
 		local screen = find_screen(sender)
-		assert(screen, "Unable to find screen for current script url")
+		if not screen then return end
 		if screen.wait_for == WAITFOR_CONTEXT then
 			assert(coroutine.resume(screen.co))
 		end
@@ -1431,6 +1572,45 @@ function M.on_transition(id, fn)
 	local screen = screens[id]
 	screen.transition_url = fn and msg.url() or nil
 	screen.transition_fn = fn
+end
+
+--- Listen to navigation away from (or covering) this screen.
+-- Forward on_message to Monarch from the registering script, like on_transition.
+function M.on_navigation(id, fn)
+	local screen = assert(screens[tohash(id)], "Screen is not registered")
+	screen.navigation_fn = fn
+	screen.navigation_url = fn and msg.url() or nil
+end
+
+--- Register preparation for manual-ready scenes, including retained/reused ones.
+-- The callback receives the activation token; capture it in asynchronous work.
+function M.on_prepare(id, fn)
+	local screen = assert(screens[tohash(id)], "Screen is not registered")
+	screen.prepare_fn = fn
+	screen.prepare_url = fn and msg.url() or nil
+end
+
+function M.preparation_id(id)
+	local screen = screens[tohash(id)]
+	local request = screen and screen.preparation
+	return request and not request.done and request.id or nil
+end
+
+function M.ready_to_show(id, token)
+	local screen = screens[tohash(id)]
+	local request = screen and screen.preparation
+	if not request or not screen.manual_ready or not request.signal(token) then return false end
+	if screen.wait_for == WAITFOR_READY then
+		msg.post(screen.script, MSG_READY, { navigation_id = token })
+	end
+	return true
+end
+
+function M.fail_to_show(id, token, reason)
+	local screen = screens[tohash(id)]
+	local request = screen and screen.preparation
+	if not request or request.id ~= token then return false end
+	return request.fail(reason or "preparation_failed")
 end
 
 ---

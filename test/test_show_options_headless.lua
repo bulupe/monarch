@@ -13,15 +13,20 @@ local function fixture()
 	local frame, order, current = 0, 0, "controller"
 	local monarch
 	local f = { history = history, load_waits = {} }
+	local clock_offset = 0
+	package.loaded.socket = { gettime = function() return frame / 60 + clock_offset end }
+	function f.block(seconds) clock_offset = clock_offset + seconds end
 	local function schedule(delay, context, fn)
 		order = order + 1
-		events[#events + 1] = { at = frame + math.max(1, delay), order = order, context = context, fn = fn }
+		local event = { at = frame + math.max(1, delay), order = order, context = context, fn = fn }
+		events[#events + 1] = event
+		return event
 	end
 	timer = { delay = function(delay, repeating, fn)
 		assert(not repeating)
 		if delay > 0 then f.load_waits[#f.load_waits + 1] = { seconds = delay, screen = current } end
-		schedule(math.max(1, math.ceil(delay * 60)), current, fn)
-	end }
+		return schedule(math.max(1, math.ceil(delay * 60)), current, fn)
+	end, cancel = function(handle) handle.cancelled = true end }
 	msg = {
 		url = function(url) return url or current end,
 		post = function(url, id, data)
@@ -31,14 +36,18 @@ local function fixture()
 			schedule(1, url, function()
 				local screen = proxies[url]
 				if screen and (id == "enable" or id == "disable" or id == "unload") then
-					drawn[screen] = id == "enable"
+					drawn[screen] = id == "enable" and not settings_by_id[screen].manual_ready
+				end
+				if screen and id == "init" and settings_by_id[screen].init then
+					settings_by_id[screen].init()
 				end
 				if id == "acquire_input_focus" then focused[url] = true end
 				if id == "release_input_focus" then focused[url] = false end
 				if id == "async_load" or id == "unload" then
 					local reply = id == "async_load" and "proxy_loaded" or "proxy_unloaded"
+					if id == "async_load" and settings_by_id[screen].fail_load then reply = "proxy_error" end
 					local delay = id == "async_load" and (settings_by_id[screen].load_delay or 1) or 1
-					schedule(delay, sender, function() monarch.on_message(reply, {}, url) end)
+					schedule(delay, sender, function() monarch.on_message(reply, { code = 5 }, url) end)
 				elseif not proxies[url] then
 					monarch.on_message(id, data, sender)
 				end
@@ -57,7 +66,8 @@ local function fixture()
 			end)
 		end,
 		create = function(url)
-			drawn[current] = true
+			drawn[current] = not settings_by_id[current].manual_ready
+			if settings_by_id[current].init then settings_by_id[current].init() end
 			return { root = current .. "_instance" }
 		end,
 		unload = function(url) factory_status[url] = 0 end,
@@ -86,7 +96,7 @@ local function fixture()
 		local event = table.remove(events, 1)
 		if event.at ~= frame then f.check_coverage() end
 		frame, current = event.at, event.context
-		event.fn()
+		if not event.cancelled then event.fn() end
 		current = "controller"
 	end
 	function f.until_true(fn)
@@ -111,6 +121,7 @@ local function fixture()
 			monarch.register_proxy(id, id .. "_proxy", settings)
 		end
 		if not settings.no_transition then monarch.on_transition(id, function(kind, message, sender)
+			if kind == monarch.TRANSITION_SHOW_IN or kind == monarch.TRANSITION_BACK_IN then drawn[id] = true end
 			local key = id .. ":" .. kind
 			if settings.hold_out and kind == monarch.TRANSITION_SHOW_OUT and not message.instant then
 				pending[key] = function() msg.post(sender, monarch.TRANSITION_DONE, {}) end
@@ -129,6 +140,16 @@ local function fixture()
 		current = "controller"
 	end
 	function f.held(id) return pending[id .. ":" .. monarch.TRANSITION_SHOW_OUT] ~= nil end
+	function f.prepare(id, fn)
+		current = id
+		monarch.on_prepare(id, fn)
+		current = "controller"
+	end
+	function f.navigation(id, fn)
+		current = id
+		monarch.on_navigation(id, fn)
+		current = "controller"
+	end
 	function f.show(id, options)
 		local done = false
 		monarch.show(id, options, nil, function() done = true end)
@@ -172,7 +193,7 @@ end
 
 for _, sequential in ipairs({ false, true }) do
 	for _, queue_next in ipairs({ false, true }) do
-		test("failed no-stack reload releases handover: sequential=" .. tostring(sequential) .. ", queued=" .. tostring(queue_next), function()
+		test("unsafe loaded reload fails before exits: sequential=" .. tostring(sequential) .. ", queued=" .. tostring(queue_next), function()
 			local f = fixture()
 			f.add("old")
 			f.add("new", { factory = true })
@@ -182,7 +203,8 @@ for _, sequential in ipairs({ false, true }) do
 			f.show("new", { no_stack = true })
 			f.settings("new").fail_load = true
 			local completed, queued_completed = 0, 0
-			f.monarch.show("new", { reload = true, sequential = sequential }, nil, function()
+			f.monarch.show("new", { reload = true, sequential = sequential }, nil, function(ok, result)
+				assert(ok == false and result.reason == "reload_requires_unloaded_screen")
 				completed = completed + 1
 			end)
 			if queue_next then
@@ -192,14 +214,12 @@ for _, sequential in ipairs({ false, true }) do
 			assert(not f.monarch.is_busy(), "Failed incoming reload left the handover busy")
 			assert(completed == 1 and f.monarch.queue_size() == 0)
 			assert(f.seen("listener", f.monarch.SCREEN_TRANSITION_FAILED))
-			-- Preserve the existing late-failure behavior: exits already started
-			-- finish unloading rather than leaving a visible, unfocused screen.
-			assert(f.seen("old_proxy", "unload") and not f.is_drawn("old"))
-			assert(not f.monarch.is_loaded("new"))
+			assert(f.monarch.is_loaded("new"))
 			if queue_next then
 				assert(queued_completed == 1 and f.monarch.is_top("queued"))
 				assert(f.is_drawn("queued") and f.is_focused("queued"))
 			else
+				assert(not f.seen("old_proxy", "unload") and f.is_drawn("old") and f.is_focused("old"))
 				assert(not f.seen("queued_proxy", "async_load"))
 				f.settings("new").fail_load = false
 				f.show("new")
@@ -456,7 +476,7 @@ test("failed preparation keeps the outgoing popup, stack and focus", function()
 	local called = false
 	f.monarch.show("new", nil, nil, function() called = true end)
 	f.drain()
-	assert(not called and not f.monarch.is_busy())
+	assert(called and not f.monarch.is_busy())
 	assert(table.concat(f.monarch.get_stack(), ",") == "base,old")
 	assert(f.is_focused("old") and not f.seen("old", f.monarch.TRANSITION_SHOW_OUT))
 	f.settings("new").fail_load = false
@@ -529,78 +549,233 @@ test("back with sequential on the last scene completes without a destination", f
 	assert(done == 1 and #f.monarch.get_stack() == 0 and not f.monarch.is_busy())
 end)
 
-test("load simulation is disabled by default", function()
+test("unregister during resource loading preserves the old screen and ignores the late reply", function()
 	local f = fixture()
 	f.add("old")
-	f.add("new")
-	f.show("old")
-	f.show("new")
-	assert(#f.load_waits == 0)
-end)
-
-for _, factory in ipairs({ false, true }) do
-	test("load simulation filters scenes, retains coverage and can be disabled, factory=" .. tostring(factory), function()
-		local f = fixture()
-		f.add("old")
-		f.add("new", { factory = factory })
-		local ids = { "new" }
-		f.monarch.set_debug_load_delay(3, ids)
-		ids[1] = "old" -- The configuration owns its filter.
-		f.show("old")
-		assert(#f.load_waits == 0)
-		f.cover("old", "new")
-		f.monarch.show("new")
-		f.until_true(function() return #f.load_waits == 1 end)
-		assert(f.load_waits[1].seconds == 3 and f.load_waits[1].screen == "new")
-		assert(f.monarch.is_busy() and f.monarch.is_top("old") and f.is_drawn("old"))
-		assert(not f.seen("new_proxy", "async_load"))
-		f.drain()
-		f.monarch.set_debug_load_delay(0)
-		f.monarch.back()
-		f.drain()
-		f.show("new")
-		assert(#f.load_waits == 1 and not f.monarch.is_busy())
-	end)
-end
-
-test("load simulation applies once to preloading, not to enabling cached resources", function()
-	local f = fixture()
-	f.add("new")
-	f.monarch.set_debug_load_delay(2)
-	f.monarch.preload("new", { keep_loaded = true })
-	f.drain()
-	assert(#f.load_waits == 1)
-	f.show("new")
-	f.monarch.back()
-	f.drain()
-	f.show("new")
-	assert(#f.load_waits == 1)
-end)
-
-test("empty simulation filter delays no screens and rejects invalid delays", function()
-	local f = fixture()
-	f.add("new")
-	f.monarch.set_debug_load_delay(3, {})
-	f.show("new")
-	assert(#f.load_waits == 0)
-	for _, value in ipairs({ -1, math.huge, 0/0, "3" }) do
-		assert(not pcall(f.monarch.set_debug_load_delay, value))
-	end
-	assert(not pcall(f.monarch.set_debug_load_delay, 3, "new"))
-end)
-
-test("unregister during simulated loading preserves the old screen without a stale timer resume", function()
-	local f = fixture()
-	f.add("old")
-	f.add("new")
+	f.add("new", { load_delay = 30 })
 	f.show("old")
 	f.cover("old")
-	f.monarch.set_debug_load_delay(3, { "new" })
 	f.monarch.show("new")
-	f.until_true(function() return #f.load_waits == 1 end)
+	f.until_true(function() return f.seen("new_proxy", "async_load") end)
 	f.monarch.unregister("new")
 	f.drain()
 	assert(not f.monarch.is_busy() and f.monarch.is_top("old") and f.is_focused("old"))
+end)
+
+for _, factory in ipairs({ false, true }) do
+	for _, preloaded in ipairs({ false, true }) do
+		for _, immediate in ipairs({ false, true }) do
+			test("manual readiness: factory=" .. tostring(factory) .. ", preloaded=" .. tostring(preloaded) .. ", init-ready=" .. tostring(immediate), function()
+				local f = fixture()
+				f.add("old")
+				local token, started
+				f.monarch.add_listener("observer")
+				local settings = { factory = factory, manual_ready = true }
+				if immediate then settings.init = function()
+					token = f.monarch.preparation_id("new")
+					assert(token and f.monarch.ready_to_show("new", token))
+				end end
+				f.add("new", settings)
+				f.navigation("old", function(event)
+					if event == f.monarch.NAVIGATION_STARTED then started = true end
+				end)
+				f.prepare("new", function(id)
+					token = id
+					assert(started and f.is_drawn("old") and not f.is_drawn("new"))
+					assert(not f.seen("old", f.monarch.TRANSITION_SHOW_OUT))
+					assert(not f.is_focused("new"))
+					timer.delay(.2, false, function() assert(f.monarch.ready_to_show("new", id)) end)
+				end)
+				f.show("old")
+				if preloaded then f.monarch.preload("new"); f.drain() end
+				f.cover("old", "new")
+				local calls = 0
+				f.monarch.show("new", { sequential = true, timeout = 1 }, nil, function(ok)
+					assert(ok); calls = calls + 1
+				end)
+				f.drain()
+				assert(started and f.seen("observer", f.monarch.NAVIGATION_FINISHED) and calls == 1 and not f.monarch.is_busy())
+				assert(f.is_drawn("new") and not f.monarch.ready_to_show("new", token))
+			end)
+		end
+	end
+end
+
+for _, stage in ipairs({ "loading", "readiness" }) do
+	test("timeout preserves old screen during " .. stage .. " and rejects late completion", function()
+		local f = fixture()
+		f.add("old")
+		f.add("new", { load_delay = stage == "loading" and 30 or 1, manual_ready = stage == "readiness" })
+		f.show("old")
+		f.cover("old")
+		local token, failures, calls = nil, 0, 0
+		f.navigation("old", function(event, message)
+			if event == f.monarch.NAVIGATION_FAILED then
+				assert(message.reason == "timeout" and message.stage == stage)
+				failures = failures + 1
+			end
+		end)
+		f.prepare("new", function(id) token = id end)
+		f.monarch.show("new", { timeout = .15 }, nil, function(ok, result)
+			assert(not ok and result.reason == "timeout"); calls = calls + 1
+		end)
+		f.drain()
+		assert(calls == 1 and failures == 1 and not f.monarch.is_busy())
+		assert(f.monarch.is_top("old") and f.is_focused("old"))
+		assert(not f.seen("old", f.monarch.TRANSITION_SHOW_OUT))
+		assert(not f.is_drawn("new") and not f.monarch.is_loaded("new"))
+		assert(not f.monarch.ready_to_show("new", token))
+		f.settings("new").load_delay = 1
+		f.prepare("new", function(id)
+			assert(id ~= token)
+			assert(not f.monarch.ready_to_show("new", token))
+			assert(f.monarch.ready_to_show("new", id))
+		end)
+		f.cover("old", "new")
+		f.show("new", { timeout = 1 })
+		assert(f.monarch.is_top("new"))
+	end)
+end
+
+test("timeout releases the queue while late loading is reserved for cleanup", function()
+	local f = fixture()
+	f.add("old"); f.add("slow", { load_delay = 40 }); f.add("queued")
+	f.show("old")
+	local failure, rejected = 0, 0
+	f.monarch.show("slow", { timeout = .1 }, nil, function(ok, result)
+		assert(not ok and result.reason == "timeout"); failure = failure + 1
+	end)
+	f.monarch.show("slow", nil, nil, function(ok, result)
+		assert(not ok and result.reason == "cleanup_pending"); rejected = rejected + 1
+	end)
+	f.monarch.show("queued")
+	f.drain()
+	assert(failure == 1 and rejected == 1 and f.monarch.is_top("queued"))
+	assert(f.is_drawn("queued") and not f.is_drawn("slow") and not f.monarch.is_busy())
+end)
+
+test("synchronous initialization overrun fails before outgoing exits", function()
+	local f = fixture()
+	f.add("old")
+	f.add("new", { init = function()
+		-- The clock advances without delivering the scheduled timer callback.
+		f.block(2)
+	end })
+	f.show("old")
+	f.cover("old")
+	local called = 0
+	f.monarch.show("new", { timeout = 1 }, nil, function(ok, result)
+		assert(not ok and result.reason == "timeout" and result.stage == "initializing")
+		called = called + 1
+	end)
+	f.drain()
+	assert(called == 1 and not f.monarch.is_busy() and f.is_focused("old"))
+	assert(not f.seen("old", f.monarch.TRANSITION_SHOW_OUT))
+end)
+
+test("manual popup covers its source only after readiness and reports completion to it", function()
+	local f = fixture()
+	f.add("base"); f.add("popup", { popup = true, manual_ready = true })
+	f.show("base")
+	local token, finished
+	f.navigation("base", function(event) if event == f.monarch.NAVIGATION_FINISHED then finished = true end end)
+	f.prepare("popup", function(id) token = id end)
+	f.monarch.show("popup")
+	f.drain()
+	assert(token and f.is_focused("base") and not f.is_drawn("popup"))
+	assert(f.monarch.ready_to_show("popup", token))
+	f.drain()
+	assert(finished and f.is_drawn("base") and f.is_drawn("popup") and f.is_focused("popup"))
+end)
+
+test("retained manual scene gets a fresh preparation token when backing into it", function()
+	local f = fixture()
+	f.add("level", { manual_ready = true, auto_preload = true }); f.add("menu")
+	local previous, count = nil, 0
+	f.prepare("level", function(id)
+		assert(id ~= previous and not f.monarch.ready_to_show("level", previous))
+		previous, count = id, count + 1
+		assert(f.monarch.ready_to_show("level", id))
+	end)
+	f.show("level"); f.show("menu")
+	f.cover("menu", "level")
+	local done
+	f.monarch.back({ timeout = 1 }, nil, function(ok) done = ok end)
+	f.drain()
+	assert(done and count == 2 and f.monarch.is_top("level") and not f.monarch.is_busy())
+end)
+
+test("manual failure reports once and restores outgoing controls through notification", function()
+	local f = fixture()
+	f.add("old"); f.add("new", { manual_ready = true })
+	f.show("old")
+	f.monarch.add_listener("old") -- Also registered globally: no duplicate delivery.
+	local blocked, failures, completed = false, 0, 0
+	f.navigation("old", function(event)
+		if event == f.monarch.NAVIGATION_STARTED then blocked = true end
+		if event == f.monarch.NAVIGATION_FAILED then blocked = false; failures = failures + 1 end
+	end)
+	f.prepare("new", function(id)
+		assert(f.monarch.fail_to_show("new", id, "level_setup_failed"))
+		assert(not f.monarch.fail_to_show("new", id, "duplicate"))
+	end)
+	f.monarch.show("new", nil, nil, function(ok, result)
+		assert(not ok and result.reason == "level_setup_failed"); completed = completed + 1
+	end)
+	f.drain()
+	assert(not blocked and failures == 1 and completed == 1 and f.is_focused("old"))
+end)
+
+test("preparation timeout stops before a deliberately long outgoing transition", function()
+	local f = fixture()
+	f.add("old", { hold_out = true }); f.add("new")
+	f.show("old")
+	local calls = 0
+	f.monarch.show("new", { sequential = true, timeout = 1 }, nil, function(ok)
+		assert(ok); calls = calls + 1
+	end)
+	f.until_true(function() return f.held("old") end)
+	f.block(10)
+	f.drain()
+	assert(calls == 0 and f.monarch.is_busy())
+	f.release("old"); f.drain()
+	assert(calls == 1 and not f.monarch.is_busy())
+end)
+
+test("invalid timeouts never occupy the navigation queue", function()
+	local f = fixture(); f.add("new")
+	for _, timeout in ipairs({ -1, math.huge, 0 / 0, "2" }) do
+		assert(not pcall(f.monarch.show, "new", { timeout = timeout }))
+		assert(not pcall(f.monarch.back, { timeout = timeout }))
+		assert(not f.monarch.is_busy())
+	end
+end)
+
+test("proxy error reports failure and leaves the outgoing scene usable", function()
+	local f = fixture(); f.add("old"); f.add("new", { fail_load = true })
+	f.show("old")
+	local called = 0
+	f.monarch.show("new", nil, nil, function(ok, result)
+		assert(not ok and result.reason == "proxy_error:5"); called = called + 1
+	end)
+	f.drain()
+	assert(called == 1 and not f.monarch.is_busy() and f.is_focused("old"))
+	assert(not f.seen("old", f.monarch.TRANSITION_SHOW_OUT))
+end)
+
+test("removing a scene waiting for readiness rejects its token and releases navigation", function()
+	local f = fixture(); f.add("old"); f.add("new", { manual_ready = true })
+	f.show("old")
+	local token, called
+	f.prepare("new", function(id) token = id end)
+	f.monarch.show("new", { timeout = 1 }, nil, function(ok, result)
+		assert(not ok and result.reason == "unregistered"); called = true
+	end)
+	f.until_true(function() return token end)
+	f.monarch.unregister("new")
+	f.drain()
+	assert(called and not f.monarch.is_busy() and f.is_focused("old"))
+	assert(not f.monarch.ready_to_show("new", token))
 end)
 
 print(count .. " show/back option tests passed")

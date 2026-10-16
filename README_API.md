@@ -1,16 +1,31 @@
 
 # Monarch API
 
-## monarch.set_debug_load_delay(seconds, [screen_ids])
+## Preparation and readiness
 
-Simulate slow loading while the game loop continues to run. Disabled by default (`0` seconds). A positive finite number delays future resource loads before the proxy/factory load begins. Omit `screen_ids` to affect every screen, or pass a list of string/hash IDs; an empty list delays none. Already loaded/preloaded screens are not delayed again. Changing this setting affects future loads, not a delay already in progress. Use it from your game's debug controls and leave it disabled in release builds.
+Navigation prepares the destination before changing the stack or starting outgoing transitions. Ordinary proxy scenes are initialized before rendering is enabled. Enable `manual_ready` on the screen_proxy/screen_factory component (or registration settings) for a scene that needs asynchronous setup. Such scenes are enabled during preparation so updates and timers run: **the scene owns hiding its visuals, withholding input, and not starting gameplay until its entrance**. Factory instances also need scene-owned initial visibility because creation has no separate rendering-enable phase. Monarch does not acquire incoming input focus during preparation.
 
 ```lua
-monarch.set_debug_load_delay(3, { "buy_coins", "level_splash" })
-monarch.set_debug_load_delay(0) -- disable
+-- In a manual-ready scene's init; keep visuals hidden here.
+monarch.on_prepare("level", function(token)
+    build_level_incrementally(function()
+        monarch.ready_to_show("level", token)
+    end)
+end)
+-- Continue forwarding on_message to monarch.on_message as for transitions.
 ```
 
-The simulation exercises navigation's loading state, handover, and input/queue behavior; it does not simulate CPU/GPU stalls or allocation failures. It also affects `monarch.preload()`. Each injected delay prints its screen ID and duration.
+`on_prepare(id, fn)` runs after initialization and also when returning to a retained hidden scene. A visible scene being reused is already ready. `preparation_id(id)` returns the current activation token (or nil), allowing immediate readiness from init. `ready_to_show(id, token)` accepts a current token once; duplicate, expired and stale signals return false. Capture the token when starting asynchronous work rather than retrieving a new token in an old callback. `fail_to_show(id, token, reason)` reports setup failure. All required setup must be completed before signaling; optional decorations can continue after show-in.
+
+Preparation must use independent asynchronous work (engine resource APIs, updates, timers, events). Do not wait for another queued Monarch show/preload action to complete before signaling ready: that queue is deliberately reserved by the current navigation. Preload dependent screens before starting navigation if needed. Nested registration is supported; it does not bypass the navigation queue.
+
+Pass `timeout` in seconds to show/replace/back. Omitted or zero disables the deadline. A finite positive value covers loading, initialization and manual readiness from when the queued action starts, excluding transition animations. Synchronous Lua cannot be interrupted; elapsed wall time is checked when execution resumes. The callback receives `(success, result)` with `result.navigation_id`, and on failure `reason` and `stage` (loading/initializing/readiness). Handle false before assuming a scene appeared.
+
+Register `on_navigation(id, fn)` in the outgoing scene to receive `NAVIGATION_STARTED`, `NAVIGATION_FAILED`, and, if that scene remains loaded, `NAVIGATION_FINISHED`. Forward on_message to Monarch. Global add_listener listeners also receive these messages. Fields: navigation_id, screen (destination), previous_screen (source), operation (show/back), stage, and failure reason. Started means dequeued navigation, not a raw queued request; it is not an awaited exit transition. Failure leaves the outgoing scene's stack/focus intact so it can restore controls. Failure also emits SCREEN_TRANSITION_FAILED. Completion is after transitions and cleanup; unloaded sources cannot receive it, so use the callback or a persistent listener. Closing the last screen via back has no destination preparation phase.
+
+An underlying engine load may outlive timeout. Its scene remains reserved until completion/cleanup; attempts to reuse it report `cleanup_pending` while other destinations can proceed. A load that never reports completion remains reserved. Explicit preload/unload also reject that reserved scene rather than stealing its pending operation. Loaded-scene `reload=true` fails before teardown with `reload_requires_unloaded_screen`: an instance cannot be destroyed and preserved for recovery simultaneously. Use a separate loading scene, or unload while another scene provides coverage. Normal same-instance reuse retains it while replaying transitions.
+
+For slow-readiness testing, delay ready_to_show in your scene. The old set_debug_load_delay API has been removed; resource delays remain covered by automated tests. Readiness means safe to begin revealing, not that gameplay has started. Existing show-in, transition-finished and focus events still control presentation: entrance transition completion precedes acquiring focus and FOCUS_GAINED, then SCREEN_TRANSITION_IN_FINISHED. Custom handlers must acknowledge TRANSITION_DONE; preparation timeout does not time out an unfinished animation.
 
 ## monarch.show(screen_id, [options], [data], [callback])
 Show a Monarch screen. Note that the screen must be registered before it can be shown. The `init()` function of the screen script (either `screen_proxy.script` or `screen_factory.script`) takes care of registration. This operation will be added to the queue if Monarch is busy.
@@ -19,12 +34,13 @@ Show a Monarch screen. Note that the screen must be registered before it can be 
 * `screen_id` (string|hash) - Id of the screen to show.
 * `options` (table) - Options when showing the new screen (see below).
 * `data` (table) - Optional data to associate with the screen.  Retrieve using `monarch.data()`.
-* `callback` (function) - Optional function to call when the new screen is visible.
+* `callback` (function) - Optional `(success, result)` callback after navigation completes or preparation fails.
 
 The options table can contain the following fields:
 
 * `clear` (boolean) - If the `clear` flag is set Monarch will search the stack for the screen that is to be shown. If the screen already exists in the stack and the clear flag is set Monarch will remove all screens between the current top and the screen in question.
-* `reload` (boolean) - If the `reload` flag is set Monarch will reload the collection proxy if it's already loaded (this can happen if the previous screen was a popup).
+* `reload` (boolean) - Loaded-instance reload is rejected before teardown; see Preparation and readiness.
+* `timeout` (number) - Optional preparation deadline in seconds; zero or omitted disables it.
 * `no_stack` (boolean) - If the `no_stack` flag is set Monarch will load the screen without adding it to the screen stack.
 * `sequential` (boolean) - Finish the outgoing transition before starting the incoming transition. Resources are prepared before the exit; outgoing collection cleanup waits until the incoming collection has been enabled and initialized.
 * `parallel_popup_exit` (boolean) - Opt into concurrent popup exits when showing a non-popup screen. Defaults to false. Ignored for popup destinations and when `sequential` is true. The show callback and queued navigation wait for every departing popup as well as the screen transitions. This overlaps lifecycle operations; it does not promise same-frame loading or unloading.
@@ -36,7 +52,7 @@ Instant requests preserve transition messages, completion tracking, focus handli
 
 Visual continuity requires overlapping outgoing and incoming collection lifetimes, including with `sequential = true`. This option sequences animations; it is not an unload-before-load memory mode. Peak memory may therefore increase for scene-specific resources and instances. For heavy scenes, an intermediate lightweight loading screen can allow the previous scene to unload before preparing the next.
 
-Preparation failures before exits begin preserve the current screen. A later load failure (for example, reloading an already loaded `no_stack` screen) emits `SCREEN_TRANSITION_FAILED` and releases the handover wait so already-started exits can finish. It does not restore those outgoing scenes. Completion callbacks and queued navigation continue as before; a completion callback alone is not proof of successful loading.
+Preparation failures preserve the current screen. Check the callback's success argument and/or NAVIGATION_FAILED instead of treating every completion callback as successful loading.
 
 For example, leave gameplay and its overlays together while keeping the menu entrance:
 
@@ -72,13 +88,14 @@ Go back to a previous Monarch screen. This operation will be added to the queue 
 **PARAMETERS**
 * `options` (table) - Options when showing the new screen (see below).
 * `data` (table) - Optional data to associate with the screen you are going back to.  Retrieve using `monarch.data()`.
-* `callback` (function) - Optional function to call when the previous screen is visible.
+* `callback` (function) - Optional `(success, result)` callback after navigation completes or preparation fails.
 
 The options table can contain the following fields:
 
 * `sequential` (boolean) - Finish the outgoing transition before starting the incoming transition. Resources are prepared before the exit; outgoing collection cleanup waits until the incoming collection has been enabled and initialized.
 * `transition_in` (boolean) - Set to false to request an instant `back_in` transition.
 * `transition_out` (boolean) - Set to false to request an instant `back_out` transition.
+* `timeout` (number) - Optional preparation deadline in seconds; zero or omitted disables it.
 
 Omitted or true uses the configured animation. These are the same overrides as `show()`, applied to back transitions. Returning from a popup to its underlying non-popup screen still does not send `back_in`, since that screen remained visible. Popup teardown still finishes before that screen regains focus and resumes its timestep. `hide()` and `clear()` retain their existing signatures and defaults.
 

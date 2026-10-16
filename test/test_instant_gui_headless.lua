@@ -2,6 +2,7 @@
 -- Property/message doubles verify the helper contract, not native rendering.
 local root = debug.getinfo(1, "S").source:sub(2):match("^(.*)/test/[^/]+$") or "."
 package.path = root .. "/?.lua;" .. package.path
+package.loaded.socket = { gettime = function() return 0 end }
 hash = function(value) return value end
 local vector_mt = { __add = function(a, b)
 	return { x = a.x + b.x, y = a.y + b.y, z = a.z + b.z }
