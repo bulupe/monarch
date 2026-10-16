@@ -850,8 +850,8 @@ local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_t
 			if ready then ready() end
 			return
 		end
-		-- wait one frame so that the init() of any script have time to run before starting transitions
-		cowait(screen, 0)
+		-- prepare() already waited for initialization. Dispatch the entrance with
+		-- enable so no rendered frame exposes the GUI's default visual state.
 		reset_timestep(screen)
 		if ready then ready() end
 		transition(screen, M.TRANSITION_SHOW_IN, { previous_screen = previous_screen and previous_screen.id, instant = animate == false or nil }, wait_for_transition)
@@ -878,8 +878,7 @@ local function back_in(screen, previous_screen, wait_for_transition, cb, animate
 			if ready then ready() end
 			return
 		end
-		-- wait one frame so that the init() of any script have time to run before starting transitions
-		cowait(screen, 0)
+		-- Initialization completed during prepare(); do not render before back_in.
 		reset_timestep(screen)
 		if ready then ready() end
 		if previous_screen and not previous_screen.popup then

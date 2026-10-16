@@ -778,4 +778,24 @@ test("removing a scene waiting for readiness rejects its token and releases navi
 	assert(not f.monarch.ready_to_show("new", token))
 end)
 
+for _, sequential in ipairs({ false, true }) do
+	test("prepared show dispatches entrance with enable: sequential=" .. tostring(sequential), function()
+		local f = fixture(); f.add("old"); f.add("new")
+		f.show("old")
+		f.show("new", { sequential = sequential })
+		local enabled = f.last("new_proxy", "enable")
+		local entrance = f.last("new", f.monarch.TRANSITION_SHOW_IN)
+		assert(enabled.frame == entrance.frame, "Enabled GUI can render before entrance sets its starting state")
+	end)
+end
+
+test("prepared back dispatches entrance with enable", function()
+	local f = fixture(); f.add("old"); f.add("new")
+	f.show("old"); f.show("new")
+	f.monarch.back(); f.drain()
+	local enabled = f.last("old_proxy", "enable")
+	local entrance = f.last("old", f.monarch.TRANSITION_BACK_IN)
+	assert(enabled.frame == entrance.frame, "Returning GUI can render before its entrance")
+end)
+
 print(count .. " show/back option tests passed")
