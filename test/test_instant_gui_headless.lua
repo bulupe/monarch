@@ -29,7 +29,7 @@ gui = {
 	set_scale = function(node, value) node.scale = copy(value) end,
 	set_color = function(node, value) node.color = copy(value) end,
 	set = function(node, prop, value) node[prop] = copy(value) end,
-	cancel_animation = function(node, prop) cancellations[#cancellations + 1] = { node, prop } end,
+	cancel_animations = function(node, prop) cancellations[#cancellations + 1] = { node, prop } end,
 	animate = function(node, prop, value, easing, duration, delay, cb)
 		animations[#animations + 1] = { node = node, prop = prop, value = value, duration = duration, delay = delay, cb = cb }
 	end,

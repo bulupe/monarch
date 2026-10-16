@@ -36,7 +36,7 @@ end
 -- Instant requests must also restore the final visual state of preloaded GUIs.
 local function animate(node, property, value, easing, duration, delay, cb)
 	if duration == 0 and (delay or 0) == 0 then
-		gui.cancel_animation(node, property)
+		gui.cancel_animations(node, property)
 		gui.set(node, property, value)
 		if cb then cb() end
 	else
