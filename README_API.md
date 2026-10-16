@@ -1,6 +1,17 @@
 
 # Monarch API
 
+## monarch.set_debug_load_delay(seconds, [screen_ids])
+
+Simulate slow loading while the game loop continues to run. Disabled by default (`0` seconds). A positive finite number delays future resource loads before the proxy/factory load begins. Omit `screen_ids` to affect every screen, or pass a list of string/hash IDs; an empty list delays none. Already loaded/preloaded screens are not delayed again. Changing this setting affects future loads, not a delay already in progress. Use it from your game's debug controls and leave it disabled in release builds.
+
+```lua
+monarch.set_debug_load_delay(3, { "buy_coins", "level_splash" })
+monarch.set_debug_load_delay(0) -- disable
+```
+
+The simulation exercises navigation's loading state, handover, and input/queue behavior; it does not simulate CPU/GPU stalls or allocation failures. It also affects `monarch.preload()`. Each injected delay prints its screen ID and duration.
+
 ## monarch.show(screen_id, [options], [data], [callback])
 Show a Monarch screen. Note that the screen must be registered before it can be shown. The `init()` function of the screen script (either `screen_proxy.script` or `screen_factory.script`) takes care of registration. This operation will be added to the queue if Monarch is busy.
 

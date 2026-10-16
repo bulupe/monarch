@@ -12,14 +12,15 @@ local function fixture()
 	local coverage
 	local frame, order, current = 0, 0, "controller"
 	local monarch
-	local f = { history = history }
+	local f = { history = history, load_waits = {} }
 	local function schedule(delay, context, fn)
 		order = order + 1
 		events[#events + 1] = { at = frame + math.max(1, delay), order = order, context = context, fn = fn }
 	end
 	timer = { delay = function(delay, repeating, fn)
 		assert(not repeating)
-		schedule(1, current, fn)
+		if delay > 0 then f.load_waits[#f.load_waits + 1] = { seconds = delay, screen = current } end
+		schedule(math.max(1, math.ceil(delay * 60)), current, fn)
 	end }
 	msg = {
 		url = function(url) return url or current end,
@@ -487,6 +488,80 @@ test("back with sequential on the last scene completes without a destination", f
 	f.monarch.back({ sequential = true }, nil, function() done = done + 1 end)
 	f.drain()
 	assert(done == 1 and #f.monarch.get_stack() == 0 and not f.monarch.is_busy())
+end)
+
+test("load simulation is disabled by default", function()
+	local f = fixture()
+	f.add("old")
+	f.add("new")
+	f.show("old")
+	f.show("new")
+	assert(#f.load_waits == 0)
+end)
+
+for _, factory in ipairs({ false, true }) do
+	test("load simulation filters scenes, retains coverage and can be disabled, factory=" .. tostring(factory), function()
+		local f = fixture()
+		f.add("old")
+		f.add("new", { factory = factory })
+		local ids = { "new" }
+		f.monarch.set_debug_load_delay(3, ids)
+		ids[1] = "old" -- The configuration owns its filter.
+		f.show("old")
+		assert(#f.load_waits == 0)
+		f.cover("old", "new")
+		f.monarch.show("new")
+		f.until_true(function() return #f.load_waits == 1 end)
+		assert(f.load_waits[1].seconds == 3 and f.load_waits[1].screen == "new")
+		assert(f.monarch.is_busy() and f.monarch.is_top("old") and f.is_drawn("old"))
+		assert(not f.seen("new_proxy", "async_load"))
+		f.drain()
+		f.monarch.set_debug_load_delay(0)
+		f.monarch.back()
+		f.drain()
+		f.show("new")
+		assert(#f.load_waits == 1 and not f.monarch.is_busy())
+	end)
+end
+
+test("load simulation applies once to preloading, not to enabling cached resources", function()
+	local f = fixture()
+	f.add("new")
+	f.monarch.set_debug_load_delay(2)
+	f.monarch.preload("new", { keep_loaded = true })
+	f.drain()
+	assert(#f.load_waits == 1)
+	f.show("new")
+	f.monarch.back()
+	f.drain()
+	f.show("new")
+	assert(#f.load_waits == 1)
+end)
+
+test("empty simulation filter delays no screens and rejects invalid delays", function()
+	local f = fixture()
+	f.add("new")
+	f.monarch.set_debug_load_delay(3, {})
+	f.show("new")
+	assert(#f.load_waits == 0)
+	for _, value in ipairs({ -1, math.huge, 0/0, "3" }) do
+		assert(not pcall(f.monarch.set_debug_load_delay, value))
+	end
+	assert(not pcall(f.monarch.set_debug_load_delay, 3, "new"))
+end)
+
+test("unregister during simulated loading preserves the old screen without a stale timer resume", function()
+	local f = fixture()
+	f.add("old")
+	f.add("new")
+	f.show("old")
+	f.cover("old")
+	f.monarch.set_debug_load_delay(3, { "new" })
+	f.monarch.show("new")
+	f.until_true(function() return #f.load_waits == 1 end)
+	f.monarch.unregister("new")
+	f.drain()
+	assert(not f.monarch.is_busy() and f.monarch.is_top("old") and f.is_focused("old"))
 end)
 
 print(count .. " show/back option tests passed")

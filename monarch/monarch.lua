@@ -43,6 +43,9 @@ M.SCREEN_TRANSITION_FAILED = hash("monarch_screen_transition_failed")
 local WAIT_FOR_TRANSITION = true
 local DO_NOT_WAIT_FOR_TRANSITION = false
 
+local debug_load_delay = 0
+local debug_load_screens = nil
+
 -- all registered screens
 local screens = {}
 
@@ -70,6 +73,22 @@ local function tohash(s)
 	return hash_lookup[s]
 end
 
+--- Simulate slow resource loading without blocking the game loop.
+-- Disabled by default. Pass 0 to disable; an omitted screen_ids list targets all
+-- screens. Only future actual loads are delayed, not already preloaded screens.
+function M.set_debug_load_delay(seconds, screen_ids)
+	assert(type(seconds) == "number" and seconds >= 0 and seconds < math.huge,
+		"Load delay must be a finite non-negative number")
+	assert(screen_ids == nil or type(screen_ids) == "table", "Screen ids must be a list or nil")
+	local filter
+	if screen_ids then
+		filter = {}
+		for _, id in ipairs(screen_ids) do filter[tohash(id)] = true end
+	end
+	debug_load_delay = seconds
+	debug_load_screens = filter
+end
+
 local function pcallfn(fn, ...)
 	if fn then
 		local ok, err = pcall(fn, ...)
@@ -93,6 +112,8 @@ local function cowait(screen, delay)
 	assert(co, "You must run this from within a coroutine")
 	screen.wait_for = WAITFOR_COWAIT
 	timer.delay(delay, false, function()
+		-- unregister() already resumes the coroutine to let it exit.
+		if screen.unregistered then return end
 		screen.wait_for = nil
 		assert(coroutine.resume(co))
 	end)
@@ -438,6 +459,15 @@ local function preload(screen)
 	end
 
 	screen.preloading = true
+	local delay = debug_load_delay
+	if delay > 0 and (not debug_load_screens or debug_load_screens[screen.id]) then
+		print("Monarch simulated load delay:", delay, "seconds for", screen.id)
+		cowait(screen, delay)
+		if screen.unregistered then
+			screen.preloading = false
+			return false, "Screen was unregistered during simulated loading"
+		end
+	end
 	if screen.proxy then
 		log("preload() proxy")
 		screen.wait_for = WAITFOR_PROXY_LOADED
