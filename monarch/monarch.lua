@@ -8,6 +8,7 @@ local WAITFOR_CONTEXT = hash("waitfor_monarch_context")
 local WAITFOR_PROXY_LOADED = hash("waitfor_proxy_loaded")
 local WAITFOR_PROXY_UNLOADED = hash("waitfor_proxy_unloaded")
 local WAITFOR_TRANSITION_DONE = hash("waitfor_transition_done")
+local WAITFOR_HANDOVER = hash("waitfor_handover")
 
 local MSG_CONTEXT = hash("monarch_context")
 local MSG_PROXY_LOADED = hash("proxy_loaded")
@@ -564,6 +565,60 @@ local function run_coroutine(screen, done_cb, fn)
 	assert(coroutine.resume(co))
 end
 
+-- Keep an outgoing collection alive after its transition finishes. Its final
+-- visual state belongs to the transition handler; cleanup waits until the next
+-- collection has been enabled and its scripts have initialized.
+local function handover_gate()
+	local gate = { ready = false, waiters = {} }
+	function gate.open()
+		gate.ready = true
+		local waiters = gate.waiters
+		gate.waiters = {}
+		for _, resume in ipairs(waiters) do resume() end
+	end
+	return gate
+end
+
+local function await_handover(screen, gate, transitioned)
+	if not gate or gate.ready then
+		pcallfn(transitioned)
+		return
+	end
+	local co = coroutine.running()
+	screen.wait_for = WAITFOR_HANDOVER
+	gate.waiters[#gate.waiters + 1] = function()
+		if screen.co == co and screen.wait_for == WAITFOR_HANDOVER then
+			assert(coroutine.resume(co))
+		end
+	end
+	pcallfn(transitioned)
+	coroutine.yield()
+	screen.wait_for = nil
+	-- The gate is opened from the incoming screen's context, not ours.
+	if not screen.unregistered then change_context(screen) end
+end
+
+-- Resource loading must not consume the outgoing scene's visual lifetime.
+-- Do this before changing the stack, focus or starting any exit transitions.
+local function prepare(screen, cb)
+	local ok, err = true, nil
+	run_coroutine(screen, function() cb(ok, err) end, function()
+		change_context(screen)
+		if not screen.loaded then ok, err = preload(screen) end
+	end)
+end
+
+local function exit_before_enter(exit, screen, next_screen, callbacks, gate, animate)
+	async(function(await, resume)
+		if gate then
+			-- Wait for the animation, not for the collection to be destroyed.
+			await(exit, screen, next_screen, WAIT_FOR_TRANSITION, callbacks.track(), animate, gate, resume)
+		else
+			await(exit, screen, next_screen, WAIT_FOR_TRANSITION, resume, animate)
+		end
+	end)
+end
+
 local function disable(screen, next_screen)
 	log("disable()", screen.id)
 	run_coroutine(screen, nil, function()
@@ -588,7 +643,7 @@ local function enable(screen, previous_screen)
 	end)
 end
 
-local function show_out(screen, next_screen, wait_for_transition, cb, animate)
+local function show_out(screen, next_screen, wait_for_transition, cb, animate, gate, transitioned)
 	log("show_out()", screen.id)
 	assert(wait_for_transition ~= nil)
 	-- make sure the screen is loaded. scenario:
@@ -600,6 +655,7 @@ local function show_out(screen, next_screen, wait_for_transition, cb, animate)
 	--   - show_in for C and show_out for A again!
 	if not screen.loaded then
 		log("show_out() screen was not loaded")
+		pcallfn(transitioned)
 		cb()
 		return
 	end
@@ -616,17 +672,19 @@ local function show_out(screen, next_screen, wait_for_transition, cb, animate)
 		local current_is_popup = screen.popup
 		if (not next_is_popup and not current_is_popup) or (current_is_popup) then
 			transition(screen, M.TRANSITION_SHOW_OUT, { next_screen = next_screen.id, instant = animate == false or nil }, wait_for_transition)
+			await_handover(screen, gate, transitioned)
 			screen.visible = false
 			unload(screen)
 		elseif next_is_popup then
 			change_timestep(screen)
+			pcallfn(transitioned)
 		end
 		active_transition_count = active_transition_count - 1
 		notify_transition_listeners(M.SCREEN_TRANSITION_OUT_FINISHED, { screen = screen.id, next_screen = next_screen.id })
 	end)
 end
 
-local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_transition, cb, animate)
+local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_transition, cb, animate, ready)
 	log("show_in()", screen.id, wait_for_transition)
 	assert(wait_for_transition ~= nil)
 	run_coroutine(screen, cb, function()
@@ -653,6 +711,7 @@ local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_t
 		-- wait one frame so that the init() of any script have time to run before starting transitions
 		cowait(screen, 0)
 		reset_timestep(screen)
+		if ready then ready() end
 		transition(screen, M.TRANSITION_SHOW_IN, { previous_screen = previous_screen and previous_screen.id, instant = animate == false or nil }, wait_for_transition)
 		screen.visible = true
 		acquire_input(screen)
@@ -662,7 +721,7 @@ local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_t
 	end)
 end
 
-local function back_in(screen, previous_screen, wait_for_transition, cb, animate)
+local function back_in(screen, previous_screen, wait_for_transition, cb, animate, ready)
 	log("back_in()", screen.id)
 	assert(wait_for_transition ~= nil)
 	run_coroutine(screen, cb, function()
@@ -679,6 +738,7 @@ local function back_in(screen, previous_screen, wait_for_transition, cb, animate
 		-- wait one frame so that the init() of any script have time to run before starting transitions
 		cowait(screen, 0)
 		reset_timestep(screen)
+		if ready then ready() end
 		if previous_screen and not previous_screen.popup then
 			transition(screen, M.TRANSITION_BACK_IN, { previous_screen = previous_screen.id, instant = animate == false or nil }, wait_for_transition)
 		end
@@ -690,7 +750,7 @@ local function back_in(screen, previous_screen, wait_for_transition, cb, animate
 	end)
 end
 
-local function back_out(screen, next_screen, wait_for_transition, cb, animate)
+local function back_out(screen, next_screen, wait_for_transition, cb, animate, gate, transitioned)
 	log("back_out()", screen.id)
 	assert(wait_for_transition ~= nil)
 	run_coroutine(screen, cb, function()
@@ -700,6 +760,7 @@ local function back_out(screen, next_screen, wait_for_transition, cb, animate)
 		release_input(screen, next_screen)
 		focus_lost(screen, next_screen)
 		transition(screen, M.TRANSITION_BACK_OUT, { next_screen = next_screen and next_screen.id, instant = animate == false or nil }, wait_for_transition)
+		await_handover(screen, gate, transitioned)
 		if next_screen and screen.popup then
 			reset_timestep(next_screen)
 		end
@@ -775,6 +836,25 @@ function M.show(id, options, data, cb)
 			local callbacks = callback_tracker()
 			local transition_in = options and options.transition_in
 			local transition_out = options and options.transition_out
+			-- Reserve navigation while preparing resources, including the interval
+			-- before individual transition coroutines have started.
+			active_transition_count = active_transition_count + 1
+			if M.is_preloading(id) then
+				async(function(await, resume) await(M.when_preloaded, id, resume) end)
+			end
+			if not screen.loaded and not screen.preloaded then
+				local prepared, prepare_error
+				async(function(await, resume) prepared, prepare_error = await(prepare, screen, resume) end)
+				if not prepared then
+					active_transition_count = active_transition_count - 1
+					notify_transition_listeners(M.SCREEN_TRANSITION_FAILED, { screen = id })
+					action_error(prepare_error)
+					return
+				end
+			end
+			-- The same registered instance cannot be both retained and reloaded.
+			local gate = not (screen.loaded and M.in_stack(id)) and handover_gate() or nil
+			local ready = gate and gate.open
 
 			local top = stack[#stack]
 			-- a screen can ignore the stack by setting the no_stack to true
@@ -806,11 +886,9 @@ function M.show(id, options, data, cb)
 					end
 					stack[#stack] = nil
 					if parallel_popup_exit then
-						show_out(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_out)
+						show_out(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_out, gate)
 					else
-						async(function(await, resume)
-							await(show_out, top, screen, WAIT_FOR_TRANSITION, resume, transition_out)
-						end)
+						exit_before_enter(show_out, top, screen, callbacks, gate, transition_out)
 					end
 					top = stack[#stack]
 				end
@@ -850,20 +928,19 @@ function M.show(id, options, data, cb)
 			local same_screen = top and top.id == screen.id
 			if same_screen or (options and options.sequential) then
 				if top then
-					async(function(await, resume)
-						await(show_out, top, screen, WAIT_FOR_TRANSITION, resume, transition_out)
-					end)
+					exit_before_enter(show_out, top, screen, callbacks, gate, transition_out)
 				end
-				show_in(screen, top, options and options.reload, add_to_stack, WAIT_FOR_TRANSITION, callbacks.track(), transition_in)
+				show_in(screen, top, options and options.reload, add_to_stack, WAIT_FOR_TRANSITION, callbacks.track(), transition_in, ready)
 			else
 				-- show screen
-				show_in(screen, top, options and options.reload, add_to_stack, WAIT_FOR_TRANSITION, callbacks.track(), transition_in)
+				show_in(screen, top, options and options.reload, add_to_stack, WAIT_FOR_TRANSITION, callbacks.track(), transition_in, ready)
 				if add_to_stack and top and not top.popup then
-					show_out(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_out)
+					show_out(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_out, gate)
 				end
 			end
 
 			callbacks.when_done(function()
+				active_transition_count = active_transition_count - 1
 				pcallfn(cb)
 				pcallfn(action_done)
 			end)
@@ -975,54 +1052,76 @@ end
 function M.back(options, data, cb)
 	log("back() queuing action")
 
-	queue_action(function(action_done)
-		local callbacks = callback_tracker()
-		local transition_in = options and options.transition_in
-		local transition_out = options and options.transition_out
-		local screen = table.remove(stack)
-		if screen then
-			log("back()", screen.id)
-			local top = stack[#stack]
-			-- if we go back to the same screen we need to first hide it
-			-- and wait until it is hidden before we show it again
-			local same_screen = top and top.id == screen.id
-			if same_screen or (options and options.sequential) then
-				local back_cb = callbacks.track()
-				back_out(screen, top, WAIT_FOR_TRANSITION, function()
-					if data then
-						top.data = data
+	queue_action(function(action_done, action_error)
+		local co = coroutine.create(function()
+			local callbacks = callback_tracker()
+			local transition_in = options and options.transition_in
+			local transition_out = options and options.transition_out
+			active_transition_count = active_transition_count + 1
+			local destination = stack[#stack - 1]
+			if destination and destination ~= stack[#stack] then
+				if destination.preloading then
+					async(function(await, resume) await(M.when_preloaded, destination.id, resume) end)
+				end
+				if not destination.loaded and not destination.preloaded then
+					local ok, err
+					async(function(await, resume) ok, err = await(prepare, destination, resume) end)
+					if not ok then
+						active_transition_count = active_transition_count - 1
+						notify_transition_listeners(M.SCREEN_TRANSITION_FAILED, { screen = destination.id })
+						action_error(err)
+						return
 					end
-					back_in(top, screen, WAIT_FOR_TRANSITION, back_cb, transition_in)
-				end, transition_out)
-			else
-				if top then
-					if data then
-						top.data = data
-					end
-					-- if the screen we are backing out from is a popup and the screen we go
-					-- back to is not a popup we need to let the popup completely hide before 
-					-- we start working on the screen we go back to
-					-- we do this to ensure that we do not reset the times step of the screen
-					-- we go back to until it is no longer obscured by the popup
-					if screen.popup and not top.popup then
-						local back_cb = callbacks.track()
-						back_out(screen, top, WAIT_FOR_TRANSITION, function()
-							back_in(top, screen, WAIT_FOR_TRANSITION, back_cb, transition_in)
-						end, transition_out)
-					else
-						back_in(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_in)
-						back_out(screen, top, WAIT_FOR_TRANSITION, callbacks.track(), transition_out)
-					end
-				else
-					back_out(screen, top, WAIT_FOR_TRANSITION, callbacks.track(), transition_out)
 				end
 			end
-		end
+			local screen = table.remove(stack)
+			if screen then
+				log("back()", screen.id)
+				local top = stack[#stack]
+				-- if we go back to the same screen we need to first hide it
+				-- and wait until it is hidden before we show it again
+				local same_screen = top and top.id == screen.id
+				local gate = top and not same_screen
+					and not (screen.popup and not top.popup) and handover_gate() or nil
+				local ready = gate and gate.open
+				if same_screen or (options and options.sequential) then
+					exit_before_enter(back_out, screen, top, callbacks, gate, transition_out)
+					if top then
+						if data then top.data = data end
+						back_in(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_in, ready)
+					end
+				else
+					if top then
+						if data then
+							top.data = data
+						end
+						-- if the screen we are backing out from is a popup and the screen we go
+						-- back to is not a popup we need to let the popup completely hide before
+						-- we start working on the screen we go back to
+						-- we do this to ensure that we do not reset the times step of the screen
+						-- we go back to until it is no longer obscured by the popup
+						if screen.popup and not top.popup then
+							local back_cb = callbacks.track()
+							back_out(screen, top, WAIT_FOR_TRANSITION, function()
+								back_in(top, screen, WAIT_FOR_TRANSITION, back_cb, transition_in)
+							end, transition_out)
+						else
+							back_in(top, screen, WAIT_FOR_TRANSITION, callbacks.track(), transition_in, ready)
+							back_out(screen, top, WAIT_FOR_TRANSITION, callbacks.track(), transition_out, gate)
+						end
+					else
+						back_out(screen, top, WAIT_FOR_TRANSITION, callbacks.track(), transition_out)
+					end
+				end
+			end
 
-		callbacks.when_done(function()
-			pcallfn(cb)
-			pcallfn(action_done)
+			callbacks.when_done(function()
+				active_transition_count = active_transition_count - 1
+				pcallfn(cb)
+				pcallfn(action_done)
+			end)
 		end)
+		assert(coroutine.resume(co))
 	end)
 
 	return true -- return true for legacy reasons (before queue existed)

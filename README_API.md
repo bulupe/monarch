@@ -15,7 +15,7 @@ The options table can contain the following fields:
 * `clear` (boolean) - If the `clear` flag is set Monarch will search the stack for the screen that is to be shown. If the screen already exists in the stack and the clear flag is set Monarch will remove all screens between the current top and the screen in question.
 * `reload` (boolean) - If the `reload` flag is set Monarch will reload the collection proxy if it's already loaded (this can happen if the previous screen was a popup).
 * `no_stack` (boolean) - If the `no_stack` flag is set Monarch will load the screen without adding it to the screen stack.
-* `sequential` (boolean) - If the `sequential` flag is set Monarch will start loading the screen only after the previous screen finished transitioning out.
+* `sequential` (boolean) - Finish the outgoing transition before starting the incoming transition. Resources are prepared before the exit; outgoing collection cleanup waits until the incoming collection has been enabled and initialized.
 * `parallel_popup_exit` (boolean) - Opt into concurrent popup exits when showing a non-popup screen. Defaults to false. Ignored for popup destinations and when `sequential` is true. The show callback and queued navigation wait for every departing popup as well as the screen transitions. This overlaps lifecycle operations; it does not promise same-frame loading or unloading.
 * `transition_in` (boolean) - Set to false to request an instant `show_in` transition. Omitted or true uses the configured animation.
 * `transition_out` (boolean) - Set to false to request instant `show_out` transitions for all departing popups and the current screen. Omitted or true uses their configured animations.
@@ -61,7 +61,7 @@ Go back to a previous Monarch screen. This operation will be added to the queue 
 
 The options table can contain the following fields:
 
-* `sequential` (boolean) - If the `sequential` flag is set Monarch will start loading the screen only after the previous screen finished transitioning out.
+* `sequential` (boolean) - Finish the outgoing transition before starting the incoming transition. Resources are prepared before the exit; outgoing collection cleanup waits until the incoming collection has been enabled and initialized.
 * `transition_in` (boolean) - Set to false to request an instant `back_in` transition.
 * `transition_out` (boolean) - Set to false to request an instant `back_out` transition.
 

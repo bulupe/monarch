@@ -18,6 +18,16 @@ Monarch still delivers the appropriate `TRANSITION_SHOW_IN`, `TRANSITION_SHOW_OU
 
 The standard GUI transition helper handles the flag for all four directions. Built-in fade, slide and scale functions set the final property directly, cancel its previous animation and acknowledge completion. Custom functions registered with `.show_in()`, `.show_out()`, `.back_in()` or `.back_out()` receive duration and delay zero and must apply their final state and invoke the callback. A custom `monarch.on_transition()` handler must check `message.instant` itself and acknowledge after applying its final state. Ignoring this flag preserves its normal animation; Monarch does not forcibly interrupt arbitrary user code.
 
+## Visual handover and cleanup
+
+When navigating to a different screen with `show()`, `replace()` or `back()`, Monarch prepares the incoming resources before starting exits. It retains outgoing collections until the incoming collection is enabled and its scripts have initialized. An exit handler can finish its animation and acknowledge `TRANSITION_DONE` without destroying the background it leaves on screen. Unloading and its cleanup waits then happen after the handover, rather than creating an empty interval between collections. This also applies to popup replacement and already-preloaded destinations; no new option is required.
+
+`sequential = true` still orders exit animation before entrance animation. It no longer requires resource unloading to finish before the incoming collection can be enabled. Default popup exit animations remain serial unless `parallel_popup_exit` applies. Navigation remains busy, and its completion callback and queued requests wait for all transitions and cleanup. A resource preparation failure leaves the outgoing stack and input focus intact, emits `SCREEN_TRANSITION_FAILED`, and clears queued requests through the existing error path.
+
+Transition handlers still own visibility: a handler that fades everything to transparent can intentionally expose what is behind it. Monarch does not capture the framebuffer, force opacity, or change GUI render orders. When replacing translucent overlays, both collections may briefly be enabled during the handover. The guarantee is lifecycle coverage, not pixel-identical compositing of arbitrary transitions.
+
+Reloading/reopening the **same registered instance** retains the existing serial teardown behavior: the same instance cannot be retained while being destroyed and recreated. Use distinct screen instances or a separate transition overlay if that operation needs uninterrupted coverage. Returning from a popup to its already-visible underlying non-popup retains its existing teardown-before-resume behavior. `clear()` and hiding the last screen intentionally remove coverage.
+
 ## Transition URL
 This property is deprecated and will be removed in a future version of Monarch.
 
