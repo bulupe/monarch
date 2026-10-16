@@ -736,6 +736,8 @@ local function show_in(screen, previous_screen, reload, add_to_stack, wait_for_t
 			end
 			active_transition_count = active_transition_count - 1
 			notify_transition_listeners(M.SCREEN_TRANSITION_FAILED, { screen = screen.id })
+			-- Exits already started must finish even when the incoming load fails.
+			if ready then ready() end
 			return
 		end
 		-- wait one frame so that the init() of any script have time to run before starting transitions
@@ -763,6 +765,7 @@ local function back_in(screen, previous_screen, wait_for_transition, cb, animate
 			log("back_in()", err)
 			active_transition_count = active_transition_count - 1
 			notify_transition_listeners(M.SCREEN_TRANSITION_FAILED, { screen = screen.id })
+			if ready then ready() end
 			return
 		end
 		-- wait one frame so that the init() of any script have time to run before starting transitions
@@ -942,16 +945,6 @@ function M.show(id, options, data, cb)
 						stack[stack_top] = nil
 					end
 				end
-			end
-
-			-- wait until preloaded if it is already preloading
-			-- this can typically happen if you do a show() on app start for a
-			-- screen that has Preload set to true
-			if M.is_preloading(id) then
-				M.when_preloaded(id, function()
-					assert(coroutine.resume(co))
-				end)
-				coroutine.yield()
 			end
 
 			-- showing and hiding the same screen?

@@ -34,6 +34,10 @@ The options table can contain the following fields:
 
 Instant requests preserve transition messages, completion tracking, focus handling and unloading. The standard GUI transitions snap to their final state. Custom transition handlers must honor `message.instant`; custom GUI transition functions receive duration and delay zero. See [Transitions](README_TRANSITIONS.md#per-navigation-overrides). These options do not skip engine lifecycle waits or change which transitions are normally sent.
 
+Visual continuity requires overlapping outgoing and incoming collection lifetimes, including with `sequential = true`. This option sequences animations; it is not an unload-before-load memory mode. Peak memory may therefore increase for scene-specific resources and instances. For heavy scenes, an intermediate lightweight loading screen can allow the previous scene to unload before preparing the next.
+
+Preparation failures before exits begin preserve the current screen. A later load failure (for example, reloading an already loaded `no_stack` screen) emits `SCREEN_TRANSITION_FAILED` and releases the handover wait so already-started exits can finish. It does not restore those outgoing scenes. Completion callbacks and queued navigation continue as before; a completion callback alone is not proof of successful loading.
+
 For example, leave gameplay and its overlays together while keeping the menu entrance:
 
 ```lua

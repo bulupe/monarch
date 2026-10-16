@@ -170,6 +170,45 @@ local function stack_fixture()
 	return f
 end
 
+for _, sequential in ipairs({ false, true }) do
+	for _, queue_next in ipairs({ false, true }) do
+		test("failed no-stack reload releases handover: sequential=" .. tostring(sequential) .. ", queued=" .. tostring(queue_next), function()
+			local f = fixture()
+			f.add("old")
+			f.add("new", { factory = true })
+			f.add("queued")
+			f.monarch.add_listener("listener")
+			f.show("old")
+			f.show("new", { no_stack = true })
+			f.settings("new").fail_load = true
+			local completed, queued_completed = 0, 0
+			f.monarch.show("new", { reload = true, sequential = sequential }, nil, function()
+				completed = completed + 1
+			end)
+			if queue_next then
+				f.monarch.show("queued", nil, nil, function() queued_completed = queued_completed + 1 end)
+			end
+			f.drain()
+			assert(not f.monarch.is_busy(), "Failed incoming reload left the handover busy")
+			assert(completed == 1 and f.monarch.queue_size() == 0)
+			assert(f.seen("listener", f.monarch.SCREEN_TRANSITION_FAILED))
+			-- Preserve the existing late-failure behavior: exits already started
+			-- finish unloading rather than leaving a visible, unfocused screen.
+			assert(f.seen("old_proxy", "unload") and not f.is_drawn("old"))
+			assert(not f.monarch.is_loaded("new"))
+			if queue_next then
+				assert(queued_completed == 1 and f.monarch.is_top("queued"))
+				assert(f.is_drawn("queued") and f.is_focused("queued"))
+			else
+				assert(not f.seen("queued_proxy", "async_load"))
+				f.settings("new").fail_load = false
+				f.show("new")
+					assert(f.is_drawn("new") and f.monarch.is_top("new"))
+			end
+		end)
+	end
+end
+
 test("legacy popup exits remain serial", function()
 	local f = stack_fixture()
 	f.monarch.show("menu")
