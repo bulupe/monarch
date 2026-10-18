@@ -539,6 +539,7 @@ end
 
 local function focus_gained(screen, previous_screen)
 	log("focus_gained()", screen.id)
+	screen.focused = true
 	if screen.focus_url then
 		msg.post(screen.focus_url, M.FOCUS_GAINED, { id = previous_screen and previous_screen.id })
 	else
@@ -548,7 +549,10 @@ end
 
 local function focus_lost(screen, next_screen)
 	log("focus_lost()", screen.id)
-	if screen.unregistered then return end
+	if screen.unregistered or screen.focused == false then return end
+	-- Covered scenes already lost focus. Repeating the notification also
+	-- repeats its delivery waits, letting a parallel popup exit expose them.
+	screen.focused = false
 	if screen.focus_url then
 		msg.post(screen.focus_url, M.FOCUS_LOST, { id = next_screen and next_screen.id })
 		-- if there's no transition on the screen losing focus and it gets

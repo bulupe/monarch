@@ -185,6 +185,34 @@ local function test(name, fn)
 	print("PASS " .. name)
 end
 
+for _, popup_transition in ipairs({false,true}) do
+	test("parallel exit never exposes an already unfocused level: popup transition=" .. tostring(popup_transition), function()
+		local f=fixture()
+		local lost,gained=0,0
+		f.add("menu",{auto_preload=true})
+		f.add("level",{no_transition=true,init=function()
+			f.monarch.on_focus_changed("level",function(id)
+				if id==f.monarch.FOCUS_LOST then lost=lost+1 end
+				if id==f.monarch.FOCUS_GAINED then gained=gained+1 end
+			end)
+		end})
+		f.add("popup",{popup=true,no_transition=not popup_transition})
+		f.show("menu"); f.show("level"); f.show("popup")
+		assert(lost==1 and gained==1)
+		-- Resume and open again: focus must still cycle normally.
+		f.monarch.back(); f.drain()
+		assert(gained==2)
+		f.show("popup"); assert(lost==2)
+		function f.check_coverage()
+			assert(f.is_drawn("popup") or not f.is_drawn("level"),
+				"Popup disappeared before its covered level was removed")
+		end
+		f.show("menu",{clear=true,parallel_popup_exit=true,transition_out=false})
+		assert(lost==2,"leaving a covered level must not lose focus twice")
+		assert(f.monarch.is_visible("menu") and not f.monarch.is_busy())
+	end)
+end
+
 local function stack_fixture()
 	local f = fixture()
 	f.add("game")
